@@ -19,6 +19,7 @@ from app.models import (
     Dataset,
     DatasetVersion,
     ImportBatch,
+    Job,
     LabelDefinition,
     Membership,
     Organization,
@@ -289,6 +290,48 @@ def test_statistics_match_the_same_filtered_samples_as_the_browser(api_client) -
     assert annotated_statistics.json()["sample_count"] == 1
     assert annotated_statistics.json()["annotated_sample_count"] == 1
     assert annotated_statistics.json()["missing_annotation_count"] == 0
+
+
+def test_confirm_after_rescan_uses_a_new_import_job_key(api_client) -> None:
+    client, db, _storage = api_client
+    token = login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    organization = db.query(Organization).one()
+    user = db.query(User).one()
+    dataset = client.post(
+        "/api/datasets",
+        headers=headers,
+        json={"organization_id": str(organization.id), "name": "Rescan confirmation"},
+    ).json()
+    upload_response = client.post(
+        f"/api/datasets/{dataset['id']}/upload-sessions",
+        headers=headers,
+        json={"original_name": "rescan.zip", "batch_name": "rescan"},
+    )
+    assert upload_response.status_code == 201
+    upload_id = uuid.UUID(upload_response.json()["id"])
+    upload = db.get(UploadSession, upload_id)
+    assert upload is not None
+    upload.status = "waiting_confirmation"
+    db.add(
+        Job(
+            organization_id=organization.id,
+            job_type="import_upload",
+            resource_type="upload_session",
+            resource_id=upload.id,
+            idempotency_key=f"import-upload:{upload.id}",
+            status="failed",
+            requested_by=user.id,
+        )
+    )
+    db.commit()
+
+    confirmed = client.post(f"/api/upload-sessions/{upload.id}/confirm", headers=headers, json={})
+    assert confirmed.status_code == 202
+    assert confirmed.json()["job_type"] == "import_upload"
+    created_job = db.get(Job, uuid.UUID(confirmed.json()["id"]))
+    assert created_job is not None
+    assert created_job.idempotency_key != f"import-upload:{upload.id}"
 
 
 def test_complete_upload_accepts_a_multi_gib_archive(api_client) -> None:

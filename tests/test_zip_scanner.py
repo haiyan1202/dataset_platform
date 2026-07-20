@@ -16,11 +16,13 @@ def make_zip(entries: dict[str, bytes]) -> bytes:
 
 
 def test_scans_yolo_dataset_and_preserves_relative_names() -> None:
-    content = make_zip({
-        "data.yaml": b"names: [cat]",
-        "train/images/cat.jpg": b"image",
-        "train/labels/cat.txt": b"0 0.5 0.5 1 1",
-    })
+    content = make_zip(
+        {
+            "data.yaml": b"names: [cat]",
+            "train/images/cat.jpg": b"image",
+            "train/labels/cat.txt": b"0 0.5 0.5 1 1",
+        }
+    )
     result = scan_dataset_zip(content)
     assert result.parser_name == "yolo"
     assert result.image_count == 1
@@ -39,3 +41,16 @@ def test_rejects_file_count_limit() -> None:
     content = make_zip({"a.jpg": b"a", "b.jpg": b"b"})
     with pytest.raises(DatasetCoreError, match="import.too_many_files"):
         scan_dataset_zip(content, policy=ZipScanPolicy(max_files=1))
+
+
+def test_only_exact_train_val_test_path_parts_define_subsets() -> None:
+    content = make_zip(
+        {
+            "train/images/train.jpg": b"image",
+            "val/images/val.jpg": b"image",
+            "testing/images/not-a-test-split.jpg": b"image",
+        }
+    )
+    result = scan_dataset_zip(content)
+    assert result.image_count == 3
+    assert result.subsets == {"train": 1, "val": 1}

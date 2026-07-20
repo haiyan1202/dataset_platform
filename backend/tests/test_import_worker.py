@@ -13,13 +13,28 @@ from sqlalchemy.orm import sessionmaker
 from app.auth import hash_password
 from app.db.base import Base
 from app.jobs import tasks
-from app.models import AnnotationIndex, Asset, Dataset, DatasetVersion, ImportBatch, Job, LabelDefinition, Membership, Organization, Sample, UploadSession, User
+from app.models import (
+    AnnotationIndex,
+    Asset,
+    Dataset,
+    DatasetVersion,
+    ImportBatch,
+    Job,
+    LabelDefinition,
+    Membership,
+    Organization,
+    Sample,
+    UploadSession,
+    User,
+)
 from app.storage.service import ObjectMetadata
 
 
 class WorkerStorage:
     def __init__(self, archive: bytes) -> None:
-        self.objects: dict[tuple[str, str], bytes] = {("dataset-platform", "uploads/source"): archive}
+        self.objects: dict[tuple[str, str], bytes] = {
+            ("dataset-platform", "uploads/source"): archive
+        }
         self.uploaded_files = 0
 
     def download_to_file(self, bucket: str, object_key: str, file_path: str) -> None:
@@ -28,10 +43,14 @@ class WorkerStorage:
     def stat(self, bucket: str, object_key: str) -> ObjectMetadata:
         return ObjectMetadata(bucket, object_key, len(self.objects[(bucket, object_key)]))
 
-    def put_bytes(self, bucket: str, object_key: str, content: bytes, _content_type: str | None = None) -> None:
+    def put_bytes(
+        self, bucket: str, object_key: str, content: bytes, _content_type: str | None = None
+    ) -> None:
         self.objects[(bucket, object_key)] = content
 
-    def upload_file(self, bucket: str, object_key: str, file_path: str, _content_type: str | None = None) -> None:
+    def upload_file(
+        self, bucket: str, object_key: str, file_path: str, _content_type: str | None = None
+    ) -> None:
         self.uploaded_files += 1
         self.objects[(bucket, object_key)] = Path(file_path).read_bytes()
 
@@ -69,7 +88,9 @@ def make_archive(original_name: str, tmp_path: Path) -> bytes:
 
 
 @pytest.mark.parametrize("original_name", ["source.zip", "source.tar.gz", "source.7z"])
-def test_scan_then_confirm_import_creates_raw_normalized_and_indexed_assets(tmp_path, monkeypatch, original_name: str) -> None:
+def test_scan_then_confirm_import_creates_raw_normalized_and_indexed_assets(
+    tmp_path, monkeypatch, original_name: str
+) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'worker.db'}")
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     Base.metadata.create_all(engine)
@@ -90,13 +111,31 @@ def test_scan_then_confirm_import_creates_raw_normalized_and_indexed_assets(tmp_
         version = DatasetVersion(dataset_id=dataset.id, version_number=1, created_by=user.id)
         db.add(version)
         db.flush()
-        batch = ImportBatch(dataset_version_id=version.id, batch_number=1, batch_name="source", created_by=user.id)
+        batch = ImportBatch(
+            dataset_version_id=version.id, batch_number=1, batch_name="source", created_by=user.id
+        )
         db.add(batch)
         db.flush()
-        upload = UploadSession(organization_id=organization.id, dataset_id=dataset.id, dataset_version_id=version.id, import_batch_id=batch.id, bucket="dataset-platform", object_key="uploads/source", original_name=original_name, created_by=user.id)
+        upload = UploadSession(
+            organization_id=organization.id,
+            dataset_id=dataset.id,
+            dataset_version_id=version.id,
+            import_batch_id=batch.id,
+            bucket="dataset-platform",
+            object_key="uploads/source",
+            original_name=original_name,
+            created_by=user.id,
+        )
         db.add(upload)
         db.flush()
-        scan_job = Job(organization_id=organization.id, job_type="scan_upload", resource_type="upload_session", resource_id=upload.id, idempotency_key="scan-worker-test", requested_by=user.id)
+        scan_job = Job(
+            organization_id=organization.id,
+            job_type="scan_upload",
+            resource_type="upload_session",
+            resource_id=upload.id,
+            idempotency_key="scan-worker-test",
+            requested_by=user.id,
+        )
         db.add(scan_job)
         db.commit()
         scan_job_id = scan_job.id
@@ -111,13 +150,49 @@ def test_scan_then_confirm_import_creates_raw_normalized_and_indexed_assets(tmp_
         upload = db.get(UploadSession, upload_id)
         assert upload.status == "waiting_confirmation"
         upload.status = "importing"
-        import_job = Job(organization_id=upload.organization_id, job_type="import_upload", resource_type="upload_session", resource_id=upload.id, idempotency_key="import-worker-test", requested_by=upload.created_by)
+        import_job = Job(
+            organization_id=upload.organization_id,
+            job_type="import_upload",
+            resource_type="upload_session",
+            resource_id=upload.id,
+            idempotency_key="import-worker-test",
+            requested_by=upload.created_by,
+        )
         db.add(import_job)
         db.commit()
         import_job_id = import_job.id
 
     result = tasks.confirm_import.run(str(import_job_id))
     assert result["created_samples"] == 1
+
+    # A rescan treats the archive layout as authoritative for samples from that
+    # batch, repairing stale subset values left by earlier imports.
+    with factory() as db:
+        sample = db.query(Sample).one()
+        sample.subset = "test"
+        batch = db.get(ImportBatch, sample.import_batch_id)
+        upload = db.get(UploadSession, upload_id)
+        assert batch is not None and upload is not None
+        batch.meta_json = {"rescan": True}
+        upload.status = "importing"
+        rescan_import_job = Job(
+            organization_id=upload.organization_id,
+            job_type="import_upload",
+            resource_type="upload_session",
+            resource_id=upload.id,
+            idempotency_key=f"rescan-import-worker-test-{original_name}",
+            requested_by=upload.created_by,
+        )
+        db.add(rescan_import_job)
+        db.commit()
+        rescan_import_job_id = rescan_import_job.id
+
+    rescan_result = tasks.confirm_import.run(str(rescan_import_job_id))
+    assert rescan_result["created_samples"] == 0
+    assert rescan_result["reconciled_samples"] == 1
+
+    with factory() as db:
+        assert db.query(Sample).one().subset == "train"
 
     with factory() as db:
         sample = db.query(Sample).one()

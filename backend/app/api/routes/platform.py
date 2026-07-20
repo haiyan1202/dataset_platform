@@ -475,7 +475,9 @@ def confirm_upload(upload_session_id: uuid.UUID, user: CurrentUser, db: DB) -> J
         raise HTTPException(status_code=404, detail="upload.not_found")
     require_membership(db, upload.organization_id, user.id, write=True)
     existing = db.scalar(
-        select(Job).where(Job.resource_id == upload.id, Job.job_type == "import_upload")
+        select(Job)
+        .where(Job.resource_id == upload.id, Job.job_type == "import_upload")
+        .order_by(Job.created_at.desc())
     )
     if upload.status != "waiting_confirmation":
         if upload.status in {"importing", "ready"} and existing:
@@ -487,7 +489,10 @@ def confirm_upload(upload_session_id: uuid.UUID, user: CurrentUser, db: DB) -> J
         job_type="import_upload",
         resource_type="upload_session",
         resource_id=upload.id,
-        idempotency_key=f"import-upload:{upload.id}",
+        # A rescan can legitimately be confirmed after an earlier import attempt.
+        # Every attempt needs its own durable job key; the previous fixed key caused
+        # a PostgreSQL unique-constraint error and surfaced as internal.error.
+        idempotency_key=f"import-upload:{upload.id}:{uuid.uuid4()}",
         status="queued",
         requested_by=user.id,
     )
@@ -1130,6 +1135,7 @@ def rescan_import_batch(
     )
     upload.status = "uploaded"
     batch.status = "scanning"
+    batch.meta_json = {**(batch.meta_json or {}), "rescan": True}
     db.add(job)
     db.flush()
     audit(

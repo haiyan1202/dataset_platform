@@ -279,6 +279,7 @@ export default function App() {
     [uploads, setUploads] = useState<Upload[]>([]),
     [samples, setSamples] = useState<Sample[]>([]),
     [stats, setStats] = useState<Stats | null>(null),
+    [allStats, setAllStats] = useState<Stats | null>(null),
     [labels, setLabels] = useState<Label[]>([]),
     [issues, setIssues] = useState<Issue[]>([]),
     [history, setHistory] = useState<History[]>([]),
@@ -332,6 +333,9 @@ export default function App() {
   const hasSelectedSamples = selectedIds.length > 0;
   const allMatchingSamplesSelected =
     sampleTotal > 0 && selectedIds.length >= sampleTotal;
+  const availableSubsets = ["train", "val", "test"].filter(
+    (name) => (allStats?.by_subset?.[name] ?? 0) > 0,
+  );
 
   const reloadShell = async () => {
     if (!token) return;
@@ -363,6 +367,7 @@ export default function App() {
       partData,
       uploadData,
       nextStats,
+      nextAllStats,
       nextLabels,
       issueData,
       historyData,
@@ -376,6 +381,10 @@ export default function App() {
         token,
       ),
       api<Stats>(`/datasets/${dataset.id}/statistics?${sampleQuery(0)}`, token),
+      api<Stats>(
+        `/datasets/${dataset.id}/statistics?organization_id=${org.id}`,
+        token,
+      ),
       api<Label[]>(
         `/datasets/${dataset.id}/labels?organization_id=${org.id}`,
         token,
@@ -392,6 +401,7 @@ export default function App() {
     setBatches(partData.items);
     setUploads(uploadData.items);
     setStats(nextStats);
+    setAllStats(nextAllStats);
     setLabels(nextLabels);
     setIssues(issueData.items);
     setHistory(historyData.items);
@@ -472,6 +482,15 @@ export default function App() {
       if (requestId === selectionRequestRef.current) setSelectingAll(false);
     }
   };
+  useEffect(() => {
+    if (
+      allStats &&
+      filters.subset &&
+      !availableSubsets.includes(filters.subset)
+    ) {
+      setFilters((current) => ({ ...current, subset: "" }));
+    }
+  }, [allStats, availableSubsets, filters.subset]);
   useEffect(() => {
     if (selectAllCheckboxRef.current) {
       selectAllCheckboxRef.current.indeterminate =
@@ -1472,7 +1491,7 @@ export default function App() {
                   <div className="bulk-bar">
                     <b>已选 {selectedIds.length}</b>
                     <span>移动到</span>
-                    {["train", "val", "test"].map((name) => (
+                    {availableSubsets.map((name) => (
                       <button
                         key={name}
                         onClick={() => subset(selectedIds, name)}
@@ -1950,7 +1969,7 @@ export default function App() {
             </label>
             <fieldset>
               <legend>子集范围</legend>
-              {["train", "val", "test"].map((name) => (
+              {availableSubsets.map((name) => (
                 <label className="check-line" key={name}>
                   <input
                     type="checkbox"
