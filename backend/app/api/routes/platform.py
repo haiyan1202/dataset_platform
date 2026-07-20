@@ -10,15 +10,62 @@ from sqlalchemy.orm import Session
 
 from app.auth import create_access_token, get_current_user, require_membership, verify_password
 from app.db import get_db
-from app.jobs.tasks import confirm_import, create_export, run_quality_check, scan_upload
-from app.models import AnnotationIndex, Asset, AuditLog, Dataset, DatasetVersion, ImportBatch, Job, KeypointDefinition, LabelDefinition, Membership, OperationHistory, SampleClassIndex, Organization, QualityIssue, Sample, UploadSession, User
+from app.jobs.tasks import (
+    confirm_import,
+    create_export,
+    purge_dataset,
+    run_quality_check,
+    scan_upload,
+)
+from app.models import (
+    AnnotationIndex,
+    Asset,
+    AuditLog,
+    Dataset,
+    DatasetVersion,
+    ImportBatch,
+    Job,
+    KeypointDefinition,
+    LabelDefinition,
+    Membership,
+    OperationHistory,
+    SampleClassIndex,
+    Organization,
+    QualityIssue,
+    Sample,
+    UploadSession,
+    User,
+)
 from app.schemas import (
-    ActionJobOut, DatasetCreate, DatasetOut, ExportRequest, ImportBatchUpdate, JobOut, KeypointNamesUpdate,
-    LabelUpdate, LoginRequest, OrganizationOut, Page, SampleBulkDelete, SampleOut, SampleSubsetUpdate,
-    TokenResponse, UploadComplete, UploadSessionCreate, UploadSessionOut, UserOut,
+    ActionJobOut,
+    DatasetCreate,
+    DatasetOut,
+    DatasetPurgePreview,
+    DatasetPurgeRequest,
+    ExportRequest,
+    ImportBatchUpdate,
+    JobOut,
+    KeypointNamesUpdate,
+    RemovedDatasetOut,
+    LabelUpdate,
+    LoginRequest,
+    OrganizationOut,
+    Page,
+    SampleBulkDelete,
+    SampleOut,
+    SampleSubsetUpdate,
+    TokenResponse,
+    UploadComplete,
+    UploadSessionCreate,
+    UploadSessionOut,
+    UserOut,
 )
 from app.services import audit, create_upload_session, get_dataset_for_org, transition_job
 from app.services.history_service import record_operation, redo_operation, undo_operation
+from app.services.purge_service import (
+    collect_dataset_purge_inventory,
+    stale_worker_temp_directories,
+)
 from app.storage import get_storage
 from app.settings import get_settings
 from dataset_core.parsers import is_supported_archive_name
@@ -51,7 +98,9 @@ def _session_out(upload: UploadSession, upload_url: str | None = None) -> Upload
 def login(payload: LoginRequest, db: DB) -> TokenResponse:
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
     if user is None or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="auth.invalid_credentials")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="auth.invalid_credentials"
+        )
     return TokenResponse(access_token=create_access_token(str(user.id)))
 
 
@@ -62,21 +111,63 @@ def me(user: CurrentUser) -> User:
 
 @router.get("/organizations", response_model=list[OrganizationOut])
 def organizations(user: CurrentUser, db: DB) -> list[Organization]:
-    return list(db.scalars(
-        select(Organization).join(Membership, Membership.organization_id == Organization.id).where(
-            Membership.user_id == user.id, Membership.status == "active"
+    return list(
+        db.scalars(
+            select(Organization)
+            .join(Membership, Membership.organization_id == Organization.id)
+            .where(Membership.user_id == user.id, Membership.status == "active")
         )
-    ))
+    )
 
 
 @router.get("/datasets", response_model=Page)
-def list_datasets(organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0) -> Page:
+def list_datasets(
+    organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0
+) -> Page:
     require_membership(db, organization_id, user.id)
     limit = min(max(limit, 1), 100)
-    base = select(Dataset).where(Dataset.organization_id == organization_id, Dataset.deleted_at.is_(None))
+    base = select(Dataset).where(
+        Dataset.organization_id == organization_id, Dataset.deleted_at.is_(None)
+    )
     total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
     items = list(db.scalars(base.order_by(Dataset.created_at.desc()).offset(offset).limit(limit)))
-    return Page(items=[DatasetOut.model_validate(item).model_dump() for item in items], total=total, limit=limit, offset=offset)
+    return Page(
+        items=[DatasetOut.model_validate(item).model_dump() for item in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/datasets/removed", response_model=Page)
+def list_removed_datasets(
+    organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0
+) -> Page:
+    """List soft-deleted datasets and their database-known storage footprint."""
+    require_membership(db, organization_id, user.id)
+    limit = min(max(limit, 1), 100)
+    base = select(Dataset).where(
+        Dataset.organization_id == organization_id,
+        Dataset.deleted_at.is_not(None),
+    )
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    datasets = list(
+        db.scalars(base.order_by(Dataset.deleted_at.desc()).offset(offset).limit(limit))
+    )
+    items = []
+    for dataset in datasets:
+        inventory = collect_dataset_purge_inventory(db, dataset)
+        items.append(
+            RemovedDatasetOut(
+                **DatasetOut.model_validate(dataset).model_dump(),
+                deleted_at=dataset.deleted_at,
+                estimated_bytes=inventory.estimated_bytes,
+                sample_count=inventory.sample_count,
+                batch_count=len(inventory.batch_ids),
+                source_upload_count=len(inventory.upload_ids),
+            ).model_dump()
+        )
+    return Page(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.post("/datasets", response_model=DatasetOut, status_code=status.HTTP_201_CREATED)
@@ -105,8 +196,22 @@ def create_dataset(payload: DatasetCreate, request: Request, user: CurrentUser, 
     return dataset
 
 
+def _get_removed_dataset_for_org(
+    db: Session, dataset_id: uuid.UUID, organization_id: uuid.UUID
+) -> Dataset | None:
+    return db.scalar(
+        select(Dataset).where(
+            Dataset.id == dataset_id,
+            Dataset.organization_id == organization_id,
+            Dataset.deleted_at.is_not(None),
+        )
+    )
+
+
 @router.get("/datasets/{dataset_id}", response_model=DatasetOut)
-def get_dataset(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> Dataset:
+def get_dataset(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> Dataset:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
@@ -115,19 +220,166 @@ def get_dataset(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: Current
 
 
 @router.delete("/datasets/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_dataset(dataset_id: uuid.UUID, organization_id: uuid.UUID, request: Request, user: CurrentUser, db: DB) -> None:
+def delete_dataset(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, request: Request, user: CurrentUser, db: DB
+) -> None:
     require_membership(db, organization_id, user.id, write=True)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     from datetime import datetime, timezone
+
     dataset.deleted_at = datetime.now(timezone.utc)
-    audit(db, organization_id=organization_id, user_id=user.id, action="dataset.soft_delete", resource_type="dataset", resource_id=dataset.id, request_id=request.headers.get("X-Request-ID"))
+    audit(
+        db,
+        organization_id=organization_id,
+        user_id=user.id,
+        action="dataset.soft_delete",
+        resource_type="dataset",
+        resource_id=dataset.id,
+        request_id=request.headers.get("X-Request-ID"),
+    )
     db.commit()
 
 
-@router.post("/datasets/{dataset_id}/upload-sessions", response_model=UploadSessionOut, status_code=status.HTTP_201_CREATED)
-def create_dataset_upload(dataset_id: uuid.UUID, payload: UploadSessionCreate, user: CurrentUser, db: DB, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> UploadSessionOut:
+@router.post("/datasets/{dataset_id}/restore", response_model=DatasetOut)
+def restore_dataset(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, request: Request, user: CurrentUser, db: DB
+) -> Dataset:
+    require_membership(db, organization_id, user.id, write=True)
+    dataset = _get_removed_dataset_for_org(db, dataset_id, organization_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="dataset.removed_not_found")
+    if dataset.status == "purging":
+        raise HTTPException(status_code=409, detail="dataset.purge_in_progress")
+    dataset.deleted_at = None
+    audit(
+        db,
+        organization_id=organization_id,
+        user_id=user.id,
+        action="dataset.restore",
+        resource_type="dataset",
+        resource_id=dataset.id,
+        request_id=request.headers.get("X-Request-ID"),
+    )
+    db.commit()
+    db.refresh(dataset)
+    return dataset
+
+
+@router.get("/datasets/{dataset_id}/purge-preview", response_model=DatasetPurgePreview)
+def dataset_purge_preview(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> DatasetPurgePreview:
+    require_membership(db, organization_id, user.id, write=True)
+    dataset = _get_removed_dataset_for_org(db, dataset_id, organization_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="dataset.removed_not_found")
+    inventory = collect_dataset_purge_inventory(db, dataset)
+    estimated_bytes = inventory.estimated_bytes
+    storage = get_storage()
+    for object_ref in inventory.object_refs:
+        if object_ref.size_bytes == 0 and storage.object_exists(
+            object_ref.bucket, object_ref.object_key
+        ):
+            estimated_bytes += storage.stat(object_ref.bucket, object_ref.object_key).size_bytes
+    active_job_ids = {
+        str(item)
+        for item in db.scalars(
+            select(Job.id).where(Job.status.in_(["queued", "pending", "running"]))
+        )
+    }
+    stale_temp = stale_worker_temp_directories(active_job_ids)
+    return DatasetPurgePreview(
+        dataset_id=dataset.id,
+        dataset_name=dataset.name,
+        sample_count=inventory.sample_count,
+        version_count=len(inventory.version_ids),
+        batch_count=len(inventory.batch_ids),
+        source_upload_count=len(inventory.upload_ids),
+        object_count=len(inventory.object_refs),
+        estimated_bytes=estimated_bytes,
+        stale_temp_directory_count=len(stale_temp),
+        stale_temp_bytes=sum(size_bytes for _directory, size_bytes in stale_temp),
+    )
+
+
+@router.post(
+    "/datasets/{dataset_id}/purge",
+    response_model=ActionJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def queue_dataset_purge(
+    dataset_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    payload: DatasetPurgeRequest,
+    user: CurrentUser,
+    db: DB,
+) -> ActionJobOut:
+    require_membership(db, organization_id, user.id, write=True)
+    dataset = _get_removed_dataset_for_org(db, dataset_id, organization_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="dataset.removed_not_found")
+    if payload.confirmation_name.strip() != dataset.name:
+        raise HTTPException(status_code=422, detail="dataset.purge_confirmation_mismatch")
+    inventory = collect_dataset_purge_inventory(db, dataset)
+    active_resource_ids = [dataset.id, *inventory.version_ids, *inventory.upload_ids]
+    active_job = db.scalar(
+        select(Job).where(
+            Job.resource_id.in_(active_resource_ids),
+            Job.status.in_(["queued", "running"]),
+        )
+    )
+    if active_job is not None:
+        raise HTTPException(status_code=409, detail="dataset.purge_active_jobs")
+    dataset.status = "purging"
+    job = Job(
+        organization_id=organization_id,
+        job_type="purge_dataset",
+        resource_type="dataset",
+        resource_id=dataset.id,
+        idempotency_key=f"purge-dataset:{dataset.id}:{uuid.uuid4()}",
+        status="queued",
+        requested_by=user.id,
+        result_json={
+            "preview": {
+                "object_count": len(inventory.object_refs),
+                "estimated_bytes": inventory.estimated_bytes,
+            }
+        },
+    )
+    db.add(job)
+    db.flush()
+    audit(
+        db,
+        organization_id=organization_id,
+        user_id=user.id,
+        action="dataset.purge.queue",
+        resource_type="job",
+        resource_id=job.id,
+        after={
+            "dataset_id": str(dataset.id),
+            "object_count": len(inventory.object_refs),
+            "estimated_bytes": inventory.estimated_bytes,
+        },
+    )
+    db.commit()
+    purge_dataset.delay(str(job.id))
+    return ActionJobOut(job=JobOut.model_validate(job))
+
+
+@router.post(
+    "/datasets/{dataset_id}/upload-sessions",
+    response_model=UploadSessionOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_dataset_upload(
+    dataset_id: uuid.UUID,
+    payload: UploadSessionCreate,
+    user: CurrentUser,
+    db: DB,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> UploadSessionOut:
     if not is_supported_archive_name(payload.original_name):
         raise HTTPException(status_code=422, detail="upload.archive_required")
     dataset = db.get(Dataset, dataset_id)
@@ -137,12 +389,17 @@ def create_dataset_upload(dataset_id: uuid.UUID, payload: UploadSessionCreate, u
     settings = get_settings()
     storage = get_storage()
     if idempotency_key:
-        existing = db.scalar(select(UploadSession).where(
-            UploadSession.organization_id == dataset.organization_id,
-            UploadSession.idempotency_key == idempotency_key,
-        ))
+        existing = db.scalar(
+            select(UploadSession).where(
+                UploadSession.organization_id == dataset.organization_id,
+                UploadSession.idempotency_key == idempotency_key,
+            )
+        )
         if existing:
-            return _session_out(existing, storage.create_upload_url(existing.bucket, existing.object_key, timedelta(hours=1)))
+            return _session_out(
+                existing,
+                storage.create_upload_url(existing.bucket, existing.object_key, timedelta(hours=1)),
+            )
     storage.ensure_bucket(settings.minio_bucket)
     upload, _job = create_upload_session(
         db,
@@ -158,8 +415,11 @@ def create_dataset_upload(dataset_id: uuid.UUID, payload: UploadSessionCreate, u
     db.commit()
     return _session_out(upload, url)
 
+
 @router.post("/upload-sessions/{upload_session_id}/complete", response_model=JobOut)
-def complete_upload(upload_session_id: uuid.UUID, payload: UploadComplete, user: CurrentUser, db: DB) -> Job:
+def complete_upload(
+    upload_session_id: uuid.UUID, payload: UploadComplete, user: CurrentUser, db: DB
+) -> Job:
     upload = db.get(UploadSession, upload_session_id)
     if upload is None:
         raise HTTPException(status_code=404, detail="upload.not_found")
@@ -194,6 +454,7 @@ def complete_upload(upload_session_id: uuid.UUID, payload: UploadComplete, user:
     scan_upload.delay(str(job.id))
     return job
 
+
 @router.get("/upload-sessions/{upload_session_id}", response_model=UploadSessionOut)
 def get_upload_session(upload_session_id: uuid.UUID, user: CurrentUser, db: DB) -> UploadSessionOut:
     upload = db.get(UploadSession, upload_session_id)
@@ -203,13 +464,19 @@ def get_upload_session(upload_session_id: uuid.UUID, user: CurrentUser, db: DB) 
     return _session_out(upload)
 
 
-@router.post("/upload-sessions/{upload_session_id}/confirm", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/upload-sessions/{upload_session_id}/confirm",
+    response_model=JobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def confirm_upload(upload_session_id: uuid.UUID, user: CurrentUser, db: DB) -> Job:
     upload = db.get(UploadSession, upload_session_id)
     if upload is None:
         raise HTTPException(status_code=404, detail="upload.not_found")
     require_membership(db, upload.organization_id, user.id, write=True)
-    existing = db.scalar(select(Job).where(Job.resource_id == upload.id, Job.job_type == "import_upload"))
+    existing = db.scalar(
+        select(Job).where(Job.resource_id == upload.id, Job.job_type == "import_upload")
+    )
     if upload.status != "waiting_confirmation":
         if upload.status in {"importing", "ready"} and existing:
             return existing
@@ -239,6 +506,7 @@ def confirm_upload(upload_session_id: uuid.UUID, user: CurrentUser, db: DB) -> J
     confirm_import.delay(str(job.id))
     return job
 
+
 @router.get("/datasets/{dataset_id}/samples", response_model=Page)
 def list_samples(
     dataset_id: uuid.UUID,
@@ -260,13 +528,17 @@ def list_samples(
         raise HTTPException(status_code=404, detail="dataset.not_found")
     limit = min(max(limit, 1), 100)
     versions = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset_id)
-    query = select(Sample).where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+    query = select(Sample).where(
+        Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None)
+    )
     if subset:
         query = query.where(Sample.subset == subset)
     if annotation_type:
         query = query.where(Sample.annotation_type == annotation_type)
     if class_id is not None:
-        query = query.join(SampleClassIndex, SampleClassIndex.sample_id == Sample.id).where(SampleClassIndex.class_id == class_id)
+        query = query.join(SampleClassIndex, SampleClassIndex.sample_id == Sample.id).where(
+            SampleClassIndex.class_id == class_id
+        )
     if file_name:
         query = query.where(Sample.file_name.ilike(f"%{file_name[:160]}%"))
     if import_batch_id:
@@ -277,7 +549,13 @@ def list_samples(
         query = query.where(Sample.annotation_asset_id.is_(None))
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     samples = list(db.scalars(query.order_by(Sample.created_at.desc()).offset(offset).limit(limit)))
-    return Page(items=[SampleOut.model_validate(item).model_dump() for item in samples], total=total, limit=limit, offset=offset)
+    return Page(
+        items=[SampleOut.model_validate(item).model_dump() for item in samples],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
 
 @router.post("/datasets/{dataset_id}/samples/subset")
 def update_sample_subsets(
@@ -292,16 +570,24 @@ def update_sample_subsets(
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     version_ids = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    samples = list(db.scalars(select(Sample).where(
-        Sample.id.in_(payload.sample_ids),
-        Sample.dataset_version_id.in_(version_ids),
-        Sample.deleted_at.is_(None),
-    )))
+    samples = list(
+        db.scalars(
+            select(Sample).where(
+                Sample.id.in_(payload.sample_ids),
+                Sample.dataset_version_id.in_(version_ids),
+                Sample.deleted_at.is_(None),
+            )
+        )
+    )
     if len(samples) != len(set(payload.sample_ids)):
         raise HTTPException(status_code=404, detail="sample.not_found")
     history_payload = {
         "samples": [
-            {"id": str(sample.id), "before": {"subset": sample.subset}, "after": {"subset": payload.subset}}
+            {
+                "id": str(sample.id),
+                "before": {"subset": sample.subset},
+                "after": {"subset": payload.subset},
+            }
             for sample in samples
         ],
     }
@@ -342,15 +628,21 @@ def delete_samples(
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     version_ids = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    samples = list(db.scalars(select(Sample).where(
-        Sample.id.in_(payload.sample_ids),
-        Sample.dataset_version_id.in_(version_ids),
-        Sample.deleted_at.is_(None),
-    )))
+    samples = list(
+        db.scalars(
+            select(Sample).where(
+                Sample.id.in_(payload.sample_ids),
+                Sample.dataset_version_id.in_(version_ids),
+                Sample.deleted_at.is_(None),
+            )
+        )
+    )
     if len(samples) != len(set(payload.sample_ids)):
         raise HTTPException(status_code=404, detail="sample.not_found")
     history_payload = {
-        "samples": [{"id": str(sample.id), "before": {"status": sample.status}} for sample in samples],
+        "samples": [
+            {"id": str(sample.id), "before": {"status": sample.status}} for sample in samples
+        ],
     }
     deleted_at = datetime.now(timezone.utc)
     for sample in samples:
@@ -377,30 +669,51 @@ def delete_samples(
     db.commit()
     return {"deleted": len(samples)}
 
+
 @router.get("/assets/{asset_id}/download-url")
-def asset_download_url(asset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> dict:
+def asset_download_url(
+    asset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> dict:
     require_membership(db, organization_id, user.id)
-    asset = db.scalar(select(Asset).where(Asset.id == asset_id, Asset.organization_id == organization_id, Asset.deleted_at.is_(None)))
+    asset = db.scalar(
+        select(Asset).where(
+            Asset.id == asset_id,
+            Asset.organization_id == organization_id,
+            Asset.deleted_at.is_(None),
+        )
+    )
     if asset is None:
         raise HTTPException(status_code=404, detail="asset.not_found")
-    return {"url": get_storage().create_download_url(asset.bucket, asset.object_key, timedelta(minutes=15)), "expires_in_seconds": 900}
+    return {
+        "url": get_storage().create_download_url(
+            asset.bucket, asset.object_key, timedelta(minutes=15)
+        ),
+        "expires_in_seconds": 900,
+    }
 
 
 @router.get("/jobs", response_model=Page)
-def list_jobs(organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0) -> Page:
+def list_jobs(
+    organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0
+) -> Page:
     require_membership(db, organization_id, user.id)
     limit = min(max(limit, 1), 100)
     query = select(Job).where(Job.organization_id == organization_id)
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     jobs = list(db.scalars(query.order_by(Job.created_at.desc()).offset(offset).limit(limit)))
-    return Page(items=[JobOut.model_validate(job).model_dump() for job in jobs], total=total, limit=limit, offset=offset)
+    return Page(
+        items=[JobOut.model_validate(job).model_dump() for job in jobs],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
 def cancel_job(job_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> Job:
     require_membership(db, organization_id, user.id, write=True)
     job = _job_for_org(db, job_id, organization_id)
-    if job.status in {"succeeded", "failed", "cancelled"}:
+    if job.status in {"succeeded", "failed", "cancelled"} or job.job_type == "purge_dataset":
         raise HTTPException(status_code=409, detail="job.not_cancellable")
     transition_job(job, status="cancelled", stage="cancelled")
     if job.resource_type == "upload_session":
@@ -422,22 +735,41 @@ def cancel_job(job_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser,
     db.commit()
     return job
 
+
 @router.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> Job:
     require_membership(db, organization_id, user.id)
     return _job_for_org(db, job_id, organization_id)
 
 
-@router.post("/datasets/{dataset_id}/quality-checks", response_model=ActionJobOut, status_code=status.HTTP_202_ACCEPTED)
-def queue_quality_check(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> ActionJobOut:
+@router.post(
+    "/datasets/{dataset_id}/quality-checks",
+    response_model=ActionJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def queue_quality_check(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> ActionJobOut:
     require_membership(db, organization_id, user.id, write=True)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
-    version = db.scalar(select(DatasetVersion).where(DatasetVersion.dataset_id == dataset.id, DatasetVersion.status == "ready").order_by(DatasetVersion.version_number.desc()))
+    version = db.scalar(
+        select(DatasetVersion)
+        .where(DatasetVersion.dataset_id == dataset.id, DatasetVersion.status == "ready")
+        .order_by(DatasetVersion.version_number.desc())
+    )
     if version is None:
         raise HTTPException(status_code=409, detail="dataset.no_ready_version")
-    job = Job(organization_id=organization_id, job_type="quality_check", resource_type="dataset_version", resource_id=version.id, idempotency_key=f"quality:{version.id}:{uuid.uuid4()}", status="queued", requested_by=user.id)
+    job = Job(
+        organization_id=organization_id,
+        job_type="quality_check",
+        resource_type="dataset_version",
+        resource_id=version.id,
+        idempotency_key=f"quality:{version.id}:{uuid.uuid4()}",
+        status="queued",
+        requested_by=user.id,
+    )
     db.add(job)
     db.flush()
     audit(
@@ -455,21 +787,44 @@ def queue_quality_check(dataset_id: uuid.UUID, organization_id: uuid.UUID, user:
 
 
 @router.get("/datasets/{dataset_id}/statistics")
-def dataset_statistics(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> dict:
+def dataset_statistics(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> dict:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     versions = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    total = db.scalar(select(func.count()).select_from(Sample).where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))) or 0
-    by_subset = dict(db.execute(select(Sample.subset, func.count()).where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None)).group_by(Sample.subset)).all())
-    by_annotation = dict(db.execute(select(Sample.annotation_type, func.count()).where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None)).group_by(Sample.annotation_type)).all())
-    by_class = dict(db.execute(
-        select(SampleClassIndex.class_id, func.count())
-        .join(Sample, Sample.id == SampleClassIndex.sample_id)
-        .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
-        .group_by(SampleClassIndex.class_id)
-    ).all())
+    total = (
+        db.scalar(
+            select(func.count())
+            .select_from(Sample)
+            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+        )
+        or 0
+    )
+    by_subset = dict(
+        db.execute(
+            select(Sample.subset, func.count())
+            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+            .group_by(Sample.subset)
+        ).all()
+    )
+    by_annotation = dict(
+        db.execute(
+            select(Sample.annotation_type, func.count())
+            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+            .group_by(Sample.annotation_type)
+        ).all()
+    )
+    by_class = dict(
+        db.execute(
+            select(SampleClassIndex.class_id, func.count())
+            .join(Sample, Sample.id == SampleClassIndex.sample_id)
+            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+            .group_by(SampleClassIndex.class_id)
+        ).all()
+    )
     annotation_totals = db.execute(
         select(
             func.coalesce(func.sum(AnnotationIndex.annotation_count), 0),
@@ -480,34 +835,49 @@ def dataset_statistics(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: 
         .join(Sample, Sample.id == AnnotationIndex.sample_id)
         .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
     ).one()
-    missing_annotation_count = db.scalar(
-        select(func.count()).select_from(Sample).where(
-            Sample.dataset_version_id.in_(versions),
-            Sample.deleted_at.is_(None),
-            Sample.annotation_asset_id.is_(None),
+    missing_annotation_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(Sample)
+            .where(
+                Sample.dataset_version_id.in_(versions),
+                Sample.deleted_at.is_(None),
+                Sample.annotation_asset_id.is_(None),
+            )
         )
-    ) or 0
+        or 0
+    )
     by_batch = [
         {"id": str(batch_id), "name": batch_name, "sample_count": count}
         for batch_id, batch_name, count in db.execute(
             select(ImportBatch.id, ImportBatch.batch_name, func.count(Sample.id))
             .join(Sample, Sample.import_batch_id == ImportBatch.id)
-            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None), ImportBatch.deleted_at.is_(None))
+            .where(
+                Sample.dataset_version_id.in_(versions),
+                Sample.deleted_at.is_(None),
+                ImportBatch.deleted_at.is_(None),
+            )
             .group_by(ImportBatch.id, ImportBatch.batch_name)
             .order_by(ImportBatch.created_at.desc())
         ).all()
     ]
-    label_rows = list(db.scalars(
-        select(LabelDefinition)
-        .join(DatasetVersion, DatasetVersion.id == LabelDefinition.dataset_version_id)
-        .where(DatasetVersion.dataset_id == dataset.id)
-        .order_by(DatasetVersion.version_number.desc(), LabelDefinition.class_id)
-    ))
+    label_rows = list(
+        db.scalars(
+            select(LabelDefinition)
+            .join(DatasetVersion, DatasetVersion.id == LabelDefinition.dataset_version_id)
+            .where(DatasetVersion.dataset_id == dataset.id)
+            .order_by(DatasetVersion.version_number.desc(), LabelDefinition.class_id)
+        )
+    )
     label_names: dict[int, str] = {}
     for label in label_rows:
         label_names.setdefault(label.class_id, label.class_name)
     class_distribution = [
-        {"class_id": class_id, "class_name": label_names.get(class_id, f"class_{class_id}"), "sample_count": count}
+        {
+            "class_id": class_id,
+            "class_name": label_names.get(class_id, f"class_{class_id}"),
+            "sample_count": count,
+        }
         for class_id, count in sorted(by_class.items())
     ]
     return {
@@ -527,13 +897,41 @@ def dataset_statistics(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: 
         },
     }
 
-@router.post("/datasets/{dataset_id}/exports", response_model=ActionJobOut, status_code=status.HTTP_202_ACCEPTED)
-def queue_export(dataset_id: uuid.UUID, organization_id: uuid.UUID, payload: ExportRequest, user: CurrentUser, db: DB) -> ActionJobOut:
+
+@router.post(
+    "/datasets/{dataset_id}/exports",
+    response_model=ActionJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def queue_export(
+    dataset_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    payload: ExportRequest,
+    user: CurrentUser,
+    db: DB,
+) -> ActionJobOut:
     require_membership(db, organization_id, user.id, write=True)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
-    job = Job(organization_id=organization_id, job_type="export", resource_type="dataset", resource_id=dataset.id, idempotency_key=f"export:{dataset.id}:{payload.format}:{uuid.uuid4()}", status="queued", requested_by=user.id, result_json={"requested_format": payload.format, "filters": {"import_batch_ids": [str(item) for item in payload.import_batch_ids], "subsets": payload.subsets, "class_ids": payload.class_ids, "include_unannotated": payload.include_unannotated}})
+    job = Job(
+        organization_id=organization_id,
+        job_type="export",
+        resource_type="dataset",
+        resource_id=dataset.id,
+        idempotency_key=f"export:{dataset.id}:{payload.format}:{uuid.uuid4()}",
+        status="queued",
+        requested_by=user.id,
+        result_json={
+            "requested_format": payload.format,
+            "filters": {
+                "import_batch_ids": [str(item) for item in payload.import_batch_ids],
+                "subsets": payload.subsets,
+                "class_ids": payload.class_ids,
+                "include_unannotated": payload.include_unannotated,
+            },
+        },
+    )
     db.add(job)
     db.flush()
     audit(
@@ -551,17 +949,47 @@ def queue_export(dataset_id: uuid.UUID, organization_id: uuid.UUID, payload: Exp
 
 
 @router.get("/datasets/{dataset_id}/import-batches", response_model=Page)
-def list_import_batches(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0) -> Page:
+def list_import_batches(
+    dataset_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    user: CurrentUser,
+    db: DB,
+    limit: int = 50,
+    offset: int = 0,
+) -> Page:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     limit = min(max(limit, 1), 100)
     versions = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    query = select(ImportBatch).where(ImportBatch.dataset_version_id.in_(versions), ImportBatch.deleted_at.is_(None)).order_by(ImportBatch.created_at.desc())
+    query = (
+        select(ImportBatch)
+        .where(ImportBatch.dataset_version_id.in_(versions), ImportBatch.deleted_at.is_(None))
+        .order_by(ImportBatch.created_at.desc())
+    )
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     batches = list(db.scalars(query.offset(offset).limit(limit)))
-    return Page(items=[{"id": str(batch.id), "dataset_version_id": str(batch.dataset_version_id), "batch_number": batch.batch_number, "batch_name": batch.batch_name, "source_type": batch.source_type, "status": batch.status, "note": batch.note, "meta": batch.meta_json, "created_at": batch.created_at.isoformat()} for batch in batches], total=total, limit=limit, offset=offset)
+    return Page(
+        items=[
+            {
+                "id": str(batch.id),
+                "dataset_version_id": str(batch.dataset_version_id),
+                "batch_number": batch.batch_number,
+                "batch_name": batch.batch_name,
+                "source_type": batch.source_type,
+                "status": batch.status,
+                "note": batch.note,
+                "meta": batch.meta_json,
+                "created_at": batch.created_at.isoformat(),
+            }
+            for batch in batches
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
 
 @router.patch("/datasets/{dataset_id}/import-batches/{batch_id}")
 def update_import_batch(
@@ -603,7 +1031,11 @@ def update_import_batch(
         dataset_id=dataset_id,
         action="import_batch.update",
         summary=f"Updated part {batch.batch_name}",
-        payload={"batch_id": str(batch.id), "before": before, "after": {"batch_name": batch.batch_name, "note": batch.note}},
+        payload={
+            "batch_id": str(batch.id),
+            "before": before,
+            "after": {"batch_name": batch.batch_name, "note": batch.note},
+        },
     )
     audit(
         db,
@@ -615,11 +1047,26 @@ def update_import_batch(
         after=changes,
     )
     db.commit()
-    return {"id": str(batch.id), "batch_name": batch.batch_name, "note": batch.note, "status": batch.status}
+    return {
+        "id": str(batch.id),
+        "batch_name": batch.batch_name,
+        "note": batch.note,
+        "status": batch.status,
+    }
 
 
-@router.post("/datasets/{dataset_id}/import-batches/{batch_id}/rescan", response_model=ActionJobOut, status_code=status.HTTP_202_ACCEPTED)
-def rescan_import_batch(dataset_id: uuid.UUID, batch_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> ActionJobOut:
+@router.post(
+    "/datasets/{dataset_id}/import-batches/{batch_id}/rescan",
+    response_model=ActionJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def rescan_import_batch(
+    dataset_id: uuid.UUID,
+    batch_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    user: CurrentUser,
+    db: DB,
+) -> ActionJobOut:
     require_membership(db, organization_id, user.id, write=True)
     batch = db.scalar(
         select(ImportBatch)
@@ -644,11 +1091,13 @@ def rescan_import_batch(dataset_id: uuid.UUID, batch_id: uuid.UUID, organization
     storage = get_storage()
     if not storage.object_exists(upload.bucket, upload.object_key):
         raise HTTPException(status_code=409, detail="import_batch.source_object_missing")
-    active = db.scalar(select(Job).where(
-        Job.resource_id == upload.id,
-        Job.job_type == "scan_upload",
-        Job.status.in_(["queued", "pending", "running"]),
-    ))
+    active = db.scalar(
+        select(Job).where(
+            Job.resource_id == upload.id,
+            Job.job_type == "scan_upload",
+            Job.status.in_(["queued", "pending", "running"]),
+        )
+    )
     if active is not None:
         return ActionJobOut(job=JobOut.model_validate(active))
     job = Job(
@@ -677,8 +1126,15 @@ def rescan_import_batch(dataset_id: uuid.UUID, batch_id: uuid.UUID, organization
     scan_upload.delay(str(job.id))
     return ActionJobOut(job=JobOut.model_validate(job))
 
+
 @router.delete("/datasets/{dataset_id}/import-batches/{batch_id}")
-def delete_import_batch(dataset_id: uuid.UUID, batch_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> dict:
+def delete_import_batch(
+    dataset_id: uuid.UUID,
+    batch_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    user: CurrentUser,
+    db: DB,
+) -> dict:
     require_membership(db, organization_id, user.id, write=True)
     batch = db.scalar(
         select(ImportBatch)
@@ -693,18 +1149,27 @@ def delete_import_batch(dataset_id: uuid.UUID, batch_id: uuid.UUID, organization
     )
     if batch is None:
         raise HTTPException(status_code=404, detail="import_batch.not_found")
-    batch_samples = list(db.scalars(select(Sample).where(Sample.import_batch_id == batch.id, Sample.deleted_at.is_(None))))
+    batch_samples = list(
+        db.scalars(
+            select(Sample).where(Sample.import_batch_id == batch.id, Sample.deleted_at.is_(None))
+        )
+    )
     history_payload = {
         "batch_id": str(batch.id),
         "before": {"status": batch.status},
-        "samples": [{"id": str(sample.id), "before": {"status": sample.status}} for sample in batch_samples],
+        "samples": [
+            {"id": str(sample.id), "before": {"status": sample.status}} for sample in batch_samples
+        ],
     }
     deleted_at = datetime.now(timezone.utc)
-    sample_count = db.execute(
-        update(Sample)
-        .where(Sample.import_batch_id == batch.id, Sample.deleted_at.is_(None))
-        .values(deleted_at=deleted_at, status="deleted")
-    ).rowcount or 0
+    sample_count = (
+        db.execute(
+            update(Sample)
+            .where(Sample.import_batch_id == batch.id, Sample.deleted_at.is_(None))
+            .values(deleted_at=deleted_at, status="deleted")
+        ).rowcount
+        or 0
+    )
     batch.deleted_at = deleted_at
     batch.status = "deleted"
     record_operation(
@@ -728,63 +1193,112 @@ def delete_import_batch(dataset_id: uuid.UUID, batch_id: uuid.UUID, organization
     db.commit()
     return {"deleted": True, "deleted_samples": sample_count}
 
+
 @router.get("/datasets/{dataset_id}/upload-sessions", response_model=Page)
-def list_dataset_uploads(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> Page:
+def list_dataset_uploads(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> Page:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
-    uploads = list(db.scalars(
-        select(UploadSession).where(UploadSession.dataset_id == dataset.id).order_by(UploadSession.created_at.desc())
-    ))
-    return Page(items=[_session_out(upload).model_dump() for upload in uploads], total=len(uploads), limit=len(uploads), offset=0)
+    uploads = list(
+        db.scalars(
+            select(UploadSession)
+            .where(UploadSession.dataset_id == dataset.id)
+            .order_by(UploadSession.created_at.desc())
+        )
+    )
+    return Page(
+        items=[_session_out(upload).model_dump() for upload in uploads],
+        total=len(uploads),
+        limit=len(uploads),
+        offset=0,
+    )
 
 
 @router.get("/samples/{sample_id}")
-def get_sample_preview(sample_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> dict:
+def get_sample_preview(
+    sample_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> dict:
     require_membership(db, organization_id, user.id)
     sample = db.scalar(
         select(Sample)
         .join(DatasetVersion, DatasetVersion.id == Sample.dataset_version_id)
         .join(Dataset, Dataset.id == DatasetVersion.dataset_id)
-        .where(Sample.id == sample_id, Dataset.organization_id == organization_id, Sample.deleted_at.is_(None))
+        .where(
+            Sample.id == sample_id,
+            Dataset.organization_id == organization_id,
+            Sample.deleted_at.is_(None),
+        )
     )
     if sample is None:
         raise HTTPException(status_code=404, detail="sample.not_found")
     image = db.get(Asset, sample.image_asset_id)
     annotation = db.get(Asset, sample.annotation_asset_id) if sample.annotation_asset_id else None
     annotation_index = db.get(AnnotationIndex, sample.id)
-    normalized = db.get(Asset, annotation_index.normalized_annotation_asset_id) if annotation_index and annotation_index.normalized_annotation_asset_id else None
+    normalized = (
+        db.get(Asset, annotation_index.normalized_annotation_asset_id)
+        if annotation_index and annotation_index.normalized_annotation_asset_id
+        else None
+    )
     storage = get_storage()
     return {
         "sample": SampleOut.model_validate(sample).model_dump(),
-        "image_url": storage.create_download_url(image.bucket, image.object_key, timedelta(minutes=15)) if image else None,
-        "annotation_url": storage.create_download_url(annotation.bucket, annotation.object_key, timedelta(minutes=15)) if annotation else None,
-        "normalized_annotation_url": storage.create_download_url(normalized.bucket, normalized.object_key, timedelta(minutes=15)) if normalized else None,
+        "image_url": storage.create_download_url(
+            image.bucket, image.object_key, timedelta(minutes=15)
+        )
+        if image
+        else None,
+        "annotation_url": storage.create_download_url(
+            annotation.bucket, annotation.object_key, timedelta(minutes=15)
+        )
+        if annotation
+        else None,
+        "normalized_annotation_url": storage.create_download_url(
+            normalized.bucket, normalized.object_key, timedelta(minutes=15)
+        )
+        if normalized
+        else None,
         "summary": {
             "annotation_count": annotation_index.annotation_count,
             "bbox_count": annotation_index.bbox_count,
             "polygon_count": annotation_index.polygon_count,
             "keypoint_count": annotation_index.keypoint_count,
-        } if annotation_index else None,
+        }
+        if annotation_index
+        else None,
     }
 
+
 @router.get("/datasets/{dataset_id}/labels")
-def list_labels(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> list[dict]:
+def list_labels(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> list[dict]:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
-    labels = list(db.scalars(
-        select(LabelDefinition)
-        .join(DatasetVersion, DatasetVersion.id == LabelDefinition.dataset_version_id)
-        .where(DatasetVersion.dataset_id == dataset.id)
-        .order_by(DatasetVersion.version_number.desc(), LabelDefinition.class_id)
-    ))
+    labels = list(
+        db.scalars(
+            select(LabelDefinition)
+            .join(DatasetVersion, DatasetVersion.id == LabelDefinition.dataset_version_id)
+            .where(DatasetVersion.dataset_id == dataset.id)
+            .order_by(DatasetVersion.version_number.desc(), LabelDefinition.class_id)
+        )
+    )
     latest_by_class: dict[int, LabelDefinition] = {}
     for item in labels:
         latest_by_class.setdefault(item.class_id, item)
-    return [{"id": str(item.id), "class_id": item.class_id, "class_name": item.class_name, "color": item.color} for item in sorted(latest_by_class.values(), key=lambda item: item.class_id)]
+    return [
+        {
+            "id": str(item.id),
+            "class_id": item.class_id,
+            "class_name": item.class_name,
+            "color": item.color,
+        }
+        for item in sorted(latest_by_class.values(), key=lambda item: item.class_id)
+    ]
 
 
 @router.put("/datasets/{dataset_id}/labels/{class_id}")
@@ -800,15 +1314,30 @@ def update_label(
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
-    versions = list(db.scalars(select(DatasetVersion).where(DatasetVersion.dataset_id == dataset.id).order_by(DatasetVersion.version_number.desc())))
+    versions = list(
+        db.scalars(
+            select(DatasetVersion)
+            .where(DatasetVersion.dataset_id == dataset.id)
+            .order_by(DatasetVersion.version_number.desc())
+        )
+    )
     if not versions:
         raise HTTPException(status_code=409, detail="dataset.no_version")
-    labels = list(db.scalars(select(LabelDefinition).where(
-        LabelDefinition.dataset_version_id.in_([item.id for item in versions]),
-        LabelDefinition.class_id == class_id,
-    )))
+    labels = list(
+        db.scalars(
+            select(LabelDefinition).where(
+                LabelDefinition.dataset_version_id.in_([item.id for item in versions]),
+                LabelDefinition.class_id == class_id,
+            )
+        )
+    )
     if not labels:
-        label = LabelDefinition(dataset_version_id=versions[0].id, class_id=class_id, class_name=payload.class_name, color=payload.color)
+        label = LabelDefinition(
+            dataset_version_id=versions[0].id,
+            class_id=class_id,
+            class_name=payload.class_name,
+            color=payload.color,
+        )
         db.add(label)
         labels = [label]
     else:
@@ -826,7 +1355,12 @@ def update_label(
     )
     db.commit()
     label = labels[0]
-    return {"id": str(label.id), "class_id": label.class_id, "class_name": label.class_name, "color": label.color}
+    return {
+        "id": str(label.id),
+        "class_id": label.class_id,
+        "class_name": label.class_name,
+        "color": label.color,
+    }
 
 
 @router.delete("/datasets/{dataset_id}/labels/{class_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -847,16 +1381,20 @@ def delete_label(
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     version_ids = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    result = db.execute(delete(LabelDefinition).where(
-        LabelDefinition.dataset_version_id.in_(version_ids),
-        LabelDefinition.class_id == class_id,
-    ))
+    result = db.execute(
+        delete(LabelDefinition).where(
+            LabelDefinition.dataset_version_id.in_(version_ids),
+            LabelDefinition.class_id == class_id,
+        )
+    )
     if not result.rowcount:
         raise HTTPException(status_code=404, detail="label.not_found")
-    db.execute(delete(KeypointDefinition).where(
-        KeypointDefinition.dataset_version_id.in_(version_ids),
-        KeypointDefinition.class_id == class_id,
-    ))
+    db.execute(
+        delete(KeypointDefinition).where(
+            KeypointDefinition.dataset_version_id.in_(version_ids),
+            KeypointDefinition.class_id == class_id,
+        )
+    )
     audit(
         db,
         organization_id=organization_id,
@@ -882,22 +1420,28 @@ def update_keypoint_names(
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
-    versions = list(db.scalars(select(DatasetVersion).where(DatasetVersion.dataset_id == dataset.id)))
+    versions = list(
+        db.scalars(select(DatasetVersion).where(DatasetVersion.dataset_id == dataset.id))
+    )
     if not versions:
         raise HTTPException(status_code=409, detail="dataset.no_version")
     version_ids = [item.id for item in versions]
-    db.execute(delete(KeypointDefinition).where(
-        KeypointDefinition.dataset_version_id.in_(version_ids),
-        KeypointDefinition.class_id == class_id,
-    ))
+    db.execute(
+        delete(KeypointDefinition).where(
+            KeypointDefinition.dataset_version_id.in_(version_ids),
+            KeypointDefinition.class_id == class_id,
+        )
+    )
     for version in versions:
         for point_index, point_name in enumerate(payload.names):
-            db.add(KeypointDefinition(
-                dataset_version_id=version.id,
-                class_id=class_id,
-                point_index=point_index,
-                point_name=point_name.strip() or f"keypoint_{point_index}",
-            ))
+            db.add(
+                KeypointDefinition(
+                    dataset_version_id=version.id,
+                    class_id=class_id,
+                    point_index=point_index,
+                    point_name=point_name.strip() or f"keypoint_{point_index}",
+                )
+            )
     audit(
         db,
         organization_id=organization_id,
@@ -910,32 +1454,79 @@ def update_keypoint_names(
     db.commit()
     return {"class_id": class_id, "names": payload.names}
 
+
 @router.get("/datasets/{dataset_id}/keypoints")
-def list_keypoints(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> list[dict]:
+def list_keypoints(
+    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> list[dict]:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     versions = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    items = list(db.scalars(select(KeypointDefinition).where(KeypointDefinition.dataset_version_id.in_(versions)).order_by(KeypointDefinition.class_id, KeypointDefinition.point_index)))
-    return [{"id": str(item.id), "class_id": item.class_id, "point_index": item.point_index, "point_name": item.point_name} for item in items]
+    items = list(
+        db.scalars(
+            select(KeypointDefinition)
+            .where(KeypointDefinition.dataset_version_id.in_(versions))
+            .order_by(KeypointDefinition.class_id, KeypointDefinition.point_index)
+        )
+    )
+    return [
+        {
+            "id": str(item.id),
+            "class_id": item.class_id,
+            "point_index": item.point_index,
+            "point_name": item.point_name,
+        }
+        for item in items
+    ]
+
 
 @router.get("/datasets/{dataset_id}/quality-issues", response_model=Page)
-def list_quality_issues(dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0) -> Page:
+def list_quality_issues(
+    dataset_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    user: CurrentUser,
+    db: DB,
+    limit: int = 50,
+    offset: int = 0,
+) -> Page:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     version_ids = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    query = select(QualityIssue).where(QualityIssue.dataset_version_id.in_(version_ids)).order_by(QualityIssue.checked_at.desc())
+    query = (
+        select(QualityIssue)
+        .where(QualityIssue.dataset_version_id.in_(version_ids))
+        .order_by(QualityIssue.checked_at.desc())
+    )
     limit = min(max(limit, 1), 100)
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     issues = list(db.scalars(query.offset(offset).limit(limit)))
-    return Page(items=[{"id": str(issue.id), "sample_id": str(issue.sample_id) if issue.sample_id else None, "issue_type": issue.issue_type, "severity": issue.severity, "detail_code": issue.detail_code, "detail": issue.detail_json or {}, "checked_at": issue.checked_at.isoformat()} for issue in issues], total=total, limit=limit, offset=offset)
+    return Page(
+        items=[
+            {
+                "id": str(issue.id),
+                "sample_id": str(issue.sample_id) if issue.sample_id else None,
+                "issue_type": issue.issue_type,
+                "severity": issue.severity,
+                "detail_code": issue.detail_code,
+                "detail": issue.detail_json or {},
+                "checked_at": issue.checked_at.isoformat(),
+            }
+            for issue in issues
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/jobs/{job_id}/download-url")
-def get_export_download_url(job_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> dict:
+def get_export_download_url(
+    job_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> dict:
     require_membership(db, organization_id, user.id)
     job = _job_for_org(db, job_id, organization_id)
     if job.job_type != "export" or job.status != "succeeded" or not job.result_json:
@@ -962,7 +1553,11 @@ def list_operation_history(
 ) -> Page:
     require_membership(db, organization_id, user.id)
     limit = min(max(limit, 1), 100)
-    query = select(OperationHistory).where(OperationHistory.organization_id == organization_id).order_by(OperationHistory.created_at.desc())
+    query = (
+        select(OperationHistory)
+        .where(OperationHistory.organization_id == organization_id)
+        .order_by(OperationHistory.created_at.desc())
+    )
     if dataset_id:
         query = query.where(OperationHistory.dataset_id == dataset_id)
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
@@ -986,12 +1581,16 @@ def list_operation_history(
 
 
 @router.post("/operation-history/{history_id}/undo")
-def undo_history(history_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> dict:
+def undo_history(
+    history_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> dict:
     require_membership(db, organization_id, user.id, write=True)
-    record = db.scalar(select(OperationHistory).where(
-        OperationHistory.id == history_id,
-        OperationHistory.organization_id == organization_id,
-    ))
+    record = db.scalar(
+        select(OperationHistory).where(
+            OperationHistory.id == history_id,
+            OperationHistory.organization_id == organization_id,
+        )
+    )
     if record is None:
         raise HTTPException(status_code=404, detail="history.not_found")
     try:
@@ -1012,12 +1611,16 @@ def undo_history(history_id: uuid.UUID, organization_id: uuid.UUID, user: Curren
 
 
 @router.post("/operation-history/{history_id}/redo")
-def redo_history(history_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB) -> dict:
+def redo_history(
+    history_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+) -> dict:
     require_membership(db, organization_id, user.id, write=True)
-    record = db.scalar(select(OperationHistory).where(
-        OperationHistory.id == history_id,
-        OperationHistory.organization_id == organization_id,
-    ))
+    record = db.scalar(
+        select(OperationHistory).where(
+            OperationHistory.id == history_id,
+            OperationHistory.organization_id == organization_id,
+        )
+    )
     if record is None:
         raise HTTPException(status_code=404, detail="history.not_found")
     try:
@@ -1036,27 +1639,33 @@ def redo_history(history_id: uuid.UUID, organization_id: uuid.UUID, user: Curren
     db.commit()
     return {"id": str(record.id), "status": record.status, "action": record.action}
 
+
 @router.get("/audit-logs", response_model=Page)
-def list_audit_logs(organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0) -> Page:
+def list_audit_logs(
+    organization_id: uuid.UUID, user: CurrentUser, db: DB, limit: int = 50, offset: int = 0
+) -> Page:
     require_membership(db, organization_id, user.id)
     limit = min(max(limit, 1), 100)
-    query = select(AuditLog).where(AuditLog.organization_id == organization_id).order_by(AuditLog.created_at.desc())
+    query = (
+        select(AuditLog)
+        .where(AuditLog.organization_id == organization_id)
+        .order_by(AuditLog.created_at.desc())
+    )
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     records = list(db.scalars(query.offset(offset).limit(limit)))
-    return Page(items=[{"id": str(item.id), "action": item.action, "resource_type": item.resource_type, "resource_id": str(item.resource_id), "request_id": item.request_id, "created_at": item.created_at.isoformat()} for item in records], total=total, limit=limit, offset=offset)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    return Page(
+        items=[
+            {
+                "id": str(item.id),
+                "action": item.action,
+                "resource_type": item.resource_type,
+                "resource_id": str(item.resource_id),
+                "request_id": item.request_id,
+                "created_at": item.created_at.isoformat(),
+            }
+            for item in records
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )

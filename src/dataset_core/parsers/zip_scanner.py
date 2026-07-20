@@ -78,6 +78,10 @@ class ArchiveReader:
         """Return temporary-disk capacity required by prepare_for_reading()."""
         return 0
 
+    def materialized_path(self, entry: ArchiveEntry) -> Path | None:
+        """Return an on-disk validated member when the reader has materialized it."""
+        return None
+
     def close(self) -> None:
         raise NotImplementedError
 
@@ -180,13 +184,26 @@ class _SevenZipArchive(ArchiveReader):
         self._archive.reset()
         self._archive.extract(path=root, targets=[str(entry.source) for entry in entries.values()])
         self._extracted_root = root
+        # py7zr can retain large decoder buffers after extraction. Import tasks only
+        # access the validated materialized files from this point onward, so release
+        # the archive before parsing thousands of annotations and writing assets.
+        self._archive.close()
+        self._archive = None
 
     def materialization_bytes(self, entries: dict[str, ArchiveEntry]) -> int:
         return sum(entry.size for entry in entries.values())
 
+    def materialized_path(self, entry: ArchiveEntry) -> Path | None:
+        if self._extracted_root is None:
+            return None
+        path = self._extracted_root / PurePosixPath(safe_relative_path(entry.name))
+        if not path.is_file():
+            raise DatasetCoreError("import.invalid_archive_entry", params={"path": entry.name})
+        return path
+
     def read(self, entry: ArchiveEntry) -> bytes:
-        if self._extracted_root is not None:
-            path = self._extracted_root / PurePosixPath(safe_relative_path(entry.name))
+        path = self.materialized_path(entry)
+        if path is not None:
             try:
                 content = path.read_bytes()
             except OSError as exc:
@@ -194,6 +211,8 @@ class _SevenZipArchive(ArchiveReader):
         else:
             # This fallback is retained for callers that only need one member.
             # Import tasks call prepare_for_reading() before parsing/materialization.
+            if self._archive is None:
+                raise DatasetCoreError("import.invalid_archive_entry", params={"path": entry.name})
             self._archive.reset()
             factory = BytesIOFactory(max(entry.size, 1))
             self._archive.extract(targets=[str(entry.source)], factory=factory)
@@ -208,7 +227,8 @@ class _SevenZipArchive(ArchiveReader):
         return content
 
     def close(self) -> None:
-        self._archive.close()
+        if self._archive is not None:
+            self._archive.close()
 
 
 def is_supported_archive_name(name: str) -> bool:

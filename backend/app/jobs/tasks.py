@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 from celery.utils.log import get_task_logger
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from dataset_core.errors import DatasetCoreError
 from dataset_core.parsers import ZipScanPolicy, archive_suffix, inspect_dataset_reader, scan_dataset_archive
@@ -20,11 +20,14 @@ from app.db import SessionLocal
 from app.models import (
     AnnotationIndex,
     Asset,
+    AuditLog,
+    Dataset,
     DatasetVersion,
     ImportBatch,
     Job,
     KeypointDefinition,
     LabelDefinition,
+    OperationHistory,
     QualityIssue,
     Sample,
     SampleClassIndex,
@@ -32,6 +35,7 @@ from app.models import (
 )
 from app.services import job_is_cancelled, transition_job
 from app.settings import get_settings
+from app.services.purge_service import mark_worker_temp_directory, remove_stale_worker_temp_directories, collect_dataset_purge_inventory
 from app.storage import get_storage
 from .celery_app import celery_app
 from .export_task import create_export  # noqa: F401
@@ -40,6 +44,22 @@ logger = get_task_logger(__name__)
 
 
 def _set_failed(db, job: Job, code: str, detail: dict | None = None) -> None:
+    transition_job(job, status="failed", stage="failed", error_code=code, error_detail=detail)
+    db.commit()
+
+
+def _set_import_failed(db, job_id: uuid.UUID, code: str, detail: dict | None = None) -> None:
+    """Recover the session after a transaction failure and expose a retryable import state."""
+    db.rollback()
+    job = db.get(Job, job_id)
+    if job is None:
+        return
+    upload = db.get(UploadSession, job.resource_id)
+    if upload is not None:
+        upload.status = "import_failed"
+        batch = db.get(ImportBatch, upload.import_batch_id)
+        if batch is not None:
+            batch.status = "import_failed"
     transition_job(job, status="failed", stage="failed", error_code=code, error_detail=detail)
     db.commit()
 
@@ -84,40 +104,60 @@ def _raw_asset(
     entries: dict[str, ArchiveEntry],
     relative_path: str,
     asset_type: str,
+    assets_by_key: dict[str, Asset],
 ) -> Asset:
     object_key = f"org/{upload.organization_id}/datasets/{upload.dataset_id}/versions/{version.id}/raw/{relative_path}"
-    asset = db.scalar(select(Asset).where(Asset.object_key == object_key))
-    if asset:
-        return asset
+    cached = assets_by_key.get(object_key)
+    if cached is not None:
+        return cached
     entry = entries[relative_path]
-    content = archive.read(entry)
-    storage.put_bytes(upload.bucket, object_key, content, mimetypes.guess_type(relative_path)[0])
+    content_type = mimetypes.guess_type(relative_path)[0]
+    source_path = archive.materialized_path(entry)
+    if source_path is not None:
+        storage.upload_file(upload.bucket, object_key, str(source_path), content_type)
+        size_bytes = source_path.stat().st_size
+        checksum = _sha256_file(source_path)
+    else:
+        content = archive.read(entry)
+        storage.put_bytes(upload.bucket, object_key, content, content_type)
+        size_bytes = len(content)
+        checksum = hashlib.sha256(content).hexdigest()
     asset = Asset(
+        id=uuid.uuid4(),
         organization_id=upload.organization_id,
         bucket=upload.bucket,
         object_key=object_key,
         original_name=PurePosixPath(relative_path).name,
         relative_path=relative_path,
         asset_type=asset_type,
-        content_type=mimetypes.guess_type(relative_path)[0],
-        size_bytes=len(content),
+        content_type=content_type,
+        size_bytes=size_bytes,
         checksum_algorithm="sha256",
-        checksum=hashlib.sha256(content).hexdigest(),
+        checksum=checksum,
     )
     db.add(asset)
-    db.flush()
+    assets_by_key[object_key] = asset
     return asset
 
 
-def _normalized_asset(db, *, storage, upload: UploadSession, version: DatasetVersion, sample) -> Asset:
+def _normalized_asset(
+    db,
+    *,
+    storage,
+    upload: UploadSession,
+    version: DatasetVersion,
+    sample,
+    assets_by_key: dict[str, Asset],
+) -> Asset:
     normalized_relative_path = f"normalized/{sample.relative_path}.json"
     object_key = f"org/{upload.organization_id}/datasets/{upload.dataset_id}/versions/{version.id}/{normalized_relative_path}"
-    asset = db.scalar(select(Asset).where(Asset.object_key == object_key))
-    if asset:
-        return asset
+    cached = assets_by_key.get(object_key)
+    if cached is not None:
+        return cached
     content = json.dumps(sample.normalized_annotation(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     storage.put_bytes(upload.bucket, object_key, content, "application/json")
     asset = Asset(
+        id=uuid.uuid4(),
         organization_id=upload.organization_id,
         bucket=upload.bucket,
         object_key=object_key,
@@ -130,7 +170,7 @@ def _normalized_asset(db, *, storage, upload: UploadSession, version: DatasetVer
         checksum=hashlib.sha256(content).hexdigest(),
     )
     db.add(asset)
-    db.flush()
+    assets_by_key[object_key] = asset
     return asset
 
 
@@ -197,6 +237,7 @@ def scan_upload(self, job_id: str) -> dict:
             metadata = storage.stat(upload.bucket, upload.object_key)
             _require_temp_space(_work_dir(), metadata.size_bytes)
             with tempfile.TemporaryDirectory(dir=_work_dir()) as temp_dir:
+                mark_worker_temp_directory(temp_dir, job.id)
                 archive_path = _download_path(temp_dir, upload.original_name)
                 storage.download_to_file(upload.bucket, upload.object_key, str(archive_path))
                 actual_checksum = _sha256_file(archive_path)
@@ -249,11 +290,16 @@ def confirm_import(self, job_id: str) -> dict:
             if job_is_cancelled(db, job):
                 return {"status": "cancelled"}
             storage = get_storage()
+            transition_job(job, status="running", stage="download", current=0, total=4)
+            db.commit()
             with tempfile.TemporaryDirectory(dir=_work_dir()) as temp_dir:
+                mark_worker_temp_directory(temp_dir, job.id)
                 archive_path = _download_path(temp_dir, upload.original_name)
                 metadata = storage.stat(upload.bucket, upload.object_key)
                 _require_temp_space(_work_dir(), metadata.size_bytes)
                 storage.download_to_file(upload.bucket, upload.object_key, str(archive_path))
+                transition_job(job, status="running", stage="prepare_archive", current=1, total=4)
+                db.commit()
                 archive = open_archive(archive_path)
                 entries = validated_entries(archive, ZipScanPolicy())
                 # 7z has no efficient random member reads. Extract its already
@@ -261,6 +307,8 @@ def confirm_import(self, job_id: str) -> dict:
                 # ZIP/TAR readers keep streaming from the archive unchanged.
                 _require_temp_space(Path(temp_dir), archive.materialization_bytes(entries))
                 archive.prepare_for_reading(Path(temp_dir) / "archive-members", entries)
+                transition_job(job, status="running", stage="parse_annotations", current=2, total=4)
+                db.commit()
                 manifest = inspect_dataset_reader(archive, entries)
                 version = db.get(DatasetVersion, upload.dataset_version_id)
                 batch = db.get(ImportBatch, upload.import_batch_id)
@@ -268,84 +316,100 @@ def confirm_import(self, job_id: str) -> dict:
                     _set_failed(db, job, "import.related_resource_missing")
                     return {"status": "failed"}
                 _upsert_labels(db, version=version, labels=manifest.labels)
-
                 _upsert_keypoints(db, version=version, samples=manifest.samples)
-                transition_job(job, status="running", stage="materialize", current=0, total=max(len(manifest.samples), 1))
+                total_samples = max(len(manifest.samples), 1)
+                batch_size = max(1, min(get_settings().import_commit_batch_size, 1_000))
+                existing_paths = set(db.scalars(select(Sample.relative_path).where(Sample.dataset_version_id == version.id)))
+                object_prefix = f"org/{upload.organization_id}/datasets/{upload.dataset_id}/versions/{version.id}/"
+                assets_by_key = {
+                    asset.object_key: asset
+                    for asset in db.scalars(select(Asset).where(Asset.object_key.like(f"{object_prefix}%")))
+                }
+                transition_job(job, status="running", stage="materialize", current=0, total=total_samples)
                 db.commit()
                 created = 0
+                pending_sample_class_indexes: list[SampleClassIndex] = []
+                pending_annotation_indexes: list[AnnotationIndex] = []
                 for index, parsed_sample in enumerate(manifest.samples, 1):
-                    if job_is_cancelled(db, job):
-                        db.commit()
-                        return {"status": "cancelled", "created_samples": created}
-                    existing = db.scalar(select(Sample).where(
-                        Sample.dataset_version_id == version.id,
-                        Sample.relative_path == parsed_sample.relative_path,
-                    ))
-                    if existing:
-                        continue
-                    image_asset = _raw_asset(
-                        db,
-                        storage=storage,
-                        upload=upload,
-                        version=version,
-                        archive=archive,
-                        entries=entries,
-                        relative_path=parsed_sample.relative_path,
-                        asset_type="image",
-                    )
-                    annotation_asset = None
-                    if parsed_sample.annotation_path and parsed_sample.annotation_path in entries:
-                        annotation_asset = _raw_asset(
+                    if parsed_sample.relative_path not in existing_paths:
+                        image_asset = _raw_asset(
                             db,
                             storage=storage,
                             upload=upload,
                             version=version,
                             archive=archive,
                             entries=entries,
-                            relative_path=parsed_sample.annotation_path,
-                            asset_type="annotation",
+                            relative_path=parsed_sample.relative_path,
+                            asset_type="image",
+                            assets_by_key=assets_by_key,
                         )
-                    normalized_asset = _normalized_asset(
-                        db,
-                        storage=storage,
-                        upload=upload,
-                        version=version,
-                        sample=parsed_sample,
-                    )
-                    path = PurePosixPath(parsed_sample.relative_path)
-                    sample = Sample(
-                        dataset_version_id=version.id,
-                        import_batch_id=batch.id,
-                        image_asset_id=image_asset.id,
-                        annotation_asset_id=annotation_asset.id if annotation_asset else None,
-                        file_name=path.name,
-                        file_stem=path.stem,
-                        relative_path=parsed_sample.relative_path,
-                        subset=parsed_sample.subset,
-                        annotation_type=parsed_sample.annotation_type,
-                        width=parsed_sample.width,
-                        height=parsed_sample.height,
-                    )
-                    db.add(sample)
-                    db.flush()
-                    summary = parsed_sample.summary
-                    for class_id in summary.class_ids:
-                        db.add(SampleClassIndex(sample_id=sample.id, class_id=class_id))
-                    db.add(AnnotationIndex(
-                        sample_id=sample.id,
-                        annotation_count=summary.annotation_count,
-                        bbox_count=summary.bbox_count,
-                        polygon_count=summary.polygon_count,
-                        keypoint_count=summary.keypoint_count,
-                        class_ids_json=list(summary.class_ids),
-                        class_counts_json={str(class_id): sum(annotation.class_id == class_id for annotation in parsed_sample.annotations) for class_id in summary.class_ids},
-                        normalized_annotation_asset_id=normalized_asset.id,
-                        parser_name=manifest.parser_name,
-                        parser_version="1",
-                    ))
-                    created += 1
-                    transition_job(job, status="running", stage="materialize", current=index, total=max(len(manifest.samples), 1))
-                    if index % 100 == 0:
+                        annotation_asset = None
+                        if parsed_sample.annotation_path and parsed_sample.annotation_path in entries:
+                            annotation_asset = _raw_asset(
+                                db,
+                                storage=storage,
+                                upload=upload,
+                                version=version,
+                                archive=archive,
+                                entries=entries,
+                                relative_path=parsed_sample.annotation_path,
+                                asset_type="annotation",
+                                assets_by_key=assets_by_key,
+                            )
+                        normalized_asset = _normalized_asset(
+                            db,
+                            storage=storage,
+                            upload=upload,
+                            version=version,
+                            sample=parsed_sample,
+                            assets_by_key=assets_by_key,
+                        )
+                        path = PurePosixPath(parsed_sample.relative_path)
+                        sample = Sample(
+                            id=uuid.uuid4(),
+                            dataset_version_id=version.id,
+                            import_batch_id=batch.id,
+                            image_asset_id=image_asset.id,
+                            annotation_asset_id=annotation_asset.id if annotation_asset else None,
+                            file_name=path.name,
+                            file_stem=path.stem,
+                            relative_path=parsed_sample.relative_path,
+                            subset=parsed_sample.subset,
+                            annotation_type=parsed_sample.annotation_type,
+                            width=parsed_sample.width,
+                            height=parsed_sample.height,
+                        )
+                        db.add(sample)
+                        summary = parsed_sample.summary
+                        for class_id in summary.class_ids:
+                            pending_sample_class_indexes.append(SampleClassIndex(sample_id=sample.id, class_id=class_id))
+                        pending_annotation_indexes.append(AnnotationIndex(
+                            sample_id=sample.id,
+                            annotation_count=summary.annotation_count,
+                            bbox_count=summary.bbox_count,
+                            polygon_count=summary.polygon_count,
+                            keypoint_count=summary.keypoint_count,
+                            class_ids_json=list(summary.class_ids),
+                            class_counts_json={str(class_id): sum(annotation.class_id == class_id for annotation in parsed_sample.annotations) for class_id in summary.class_ids},
+                            normalized_annotation_asset_id=normalized_asset.id,
+                            parser_name=manifest.parser_name,
+                            parser_version="1",
+                        ))
+                        existing_paths.add(parsed_sample.relative_path)
+                        created += 1
+                    if index % batch_size == 0 or index == len(manifest.samples):
+                        # PostgreSQL enforces these foreign keys immediately. Flush
+                        # assets/samples first, then insert their index rows in the
+                        # same transaction as the batched progress update.
+                        db.flush()
+                        db.add_all(pending_sample_class_indexes)
+                        db.add_all(pending_annotation_indexes)
+                        pending_sample_class_indexes.clear()
+                        pending_annotation_indexes.clear()
+                        if job_is_cancelled(db, job):
+                            db.commit()
+                            return {"status": "cancelled", "created_samples": created}
+                        transition_job(job, status="running", stage="materialize", current=index, total=total_samples)
                         db.commit()
                 archive.close()
             version.status = "ready"
@@ -355,12 +419,109 @@ def confirm_import(self, job_id: str) -> dict:
             db.commit()
             return job.result_json or {}
         except DatasetCoreError as exc:
-            _set_failed(db, job, exc.code, exc.params)
+            _set_import_failed(db, uuid.UUID(job_id), exc.code, exc.params)
             return {"status": "failed", "error_code": exc.code}
         except Exception:
             logger.exception("confirm_import failed job=%s", job_id)
-            _set_failed(db, job, "import.materialization_failed")
+            _set_import_failed(db, uuid.UUID(job_id), "import.materialization_failed")
             return {"status": "failed", "error_code": "import.materialization_failed"}
+
+
+def _purge_dataset_records(db, *, dataset: Dataset, inventory, keep_job_id: uuid.UUID) -> None:
+    version_ids = list(inventory.version_ids)
+    upload_ids = list(inventory.upload_ids)
+    batch_ids = list(inventory.batch_ids)
+    sample_ids = select(Sample.id).where(Sample.dataset_version_id.in_(version_ids)) if version_ids else select(Sample.id).where(False)
+
+    if version_ids:
+        db.execute(delete(QualityIssue).where(QualityIssue.dataset_version_id.in_(version_ids)))
+        db.execute(delete(SampleClassIndex).where(SampleClassIndex.sample_id.in_(sample_ids)))
+        db.execute(delete(AnnotationIndex).where(AnnotationIndex.sample_id.in_(sample_ids)))
+        db.execute(delete(Sample).where(Sample.dataset_version_id.in_(version_ids)))
+        db.execute(delete(KeypointDefinition).where(KeypointDefinition.dataset_version_id.in_(version_ids)))
+        db.execute(delete(LabelDefinition).where(LabelDefinition.dataset_version_id.in_(version_ids)))
+    if inventory.asset_ids:
+        db.execute(delete(Asset).where(Asset.id.in_(inventory.asset_ids)))
+
+    related_resource_ids = [dataset.id, *version_ids, *upload_ids, *batch_ids, *inventory.export_job_ids]
+    if related_resource_ids:
+        db.execute(delete(AuditLog).where(AuditLog.resource_id.in_(related_resource_ids)))
+        db.execute(delete(Job).where(Job.id != keep_job_id, Job.resource_id.in_(related_resource_ids)))
+    db.execute(delete(OperationHistory).where(OperationHistory.dataset_id == dataset.id))
+    db.execute(delete(UploadSession).where(UploadSession.dataset_id == dataset.id))
+    if batch_ids:
+        db.execute(delete(ImportBatch).where(ImportBatch.id.in_(batch_ids)))
+    if version_ids:
+        db.execute(update(DatasetVersion).where(DatasetVersion.id.in_(version_ids)).values(parent_version_id=None))
+        db.execute(delete(DatasetVersion).where(DatasetVersion.id.in_(version_ids)))
+    db.delete(dataset)
+
+
+@celery_app.task(bind=True, name="dataset_platform.purge_dataset", autoretry_for=(), max_retries=0)
+def purge_dataset(self, job_id: str) -> dict:
+    """Irreversibly remove a dataset's object-store data and relational records."""
+    with SessionLocal() as db:
+        job = db.get(Job, uuid.UUID(job_id))
+        if job is None or job.status in {"succeeded", "cancelled"}:
+            return {"status": "missing_or_terminal"}
+        dataset = db.get(Dataset, job.resource_id)
+        if dataset is None:
+            _set_failed(db, job, "dataset.not_found")
+            return {"status": "failed", "error_code": "dataset.not_found"}
+        try:
+            inventory = collect_dataset_purge_inventory(db, dataset)
+            storage = get_storage()
+            total_steps = max(len(inventory.object_refs) + 2, 1)
+            transition_job(job, status="running", stage="purge_storage", current=0, total=total_steps)
+            db.commit()
+            released_object_bytes = 0
+            deleted_objects = 0
+            for index, object_ref in enumerate(inventory.object_refs, 1):
+                if storage.object_exists(object_ref.bucket, object_ref.object_key):
+                    metadata = storage.stat(object_ref.bucket, object_ref.object_key)
+                    storage.delete(object_ref.bucket, object_ref.object_key)
+                    released_object_bytes += metadata.size_bytes
+                    deleted_objects += 1
+                if index % 25 == 0 or index == len(inventory.object_refs):
+                    transition_job(job, status="running", stage="purge_storage", current=index, total=total_steps)
+                    db.commit()
+
+            transition_job(job, status="running", stage="purge_database", current=len(inventory.object_refs) + 1, total=total_steps)
+            _purge_dataset_records(db, dataset=dataset, inventory=inventory, keep_job_id=job.id)
+            db.commit()
+
+            active_job_ids = {
+                str(item)
+                for item in db.scalars(select(Job.id).where(Job.status.in_(["queued", "pending", "running"])))
+            }
+            removed_temp_dirs, released_temp_bytes = remove_stale_worker_temp_directories(active_job_ids)
+            transition_job(
+                job,
+                status="succeeded",
+                stage="purged",
+                current=total_steps,
+                total=total_steps,
+                result={
+                    "deleted_objects": deleted_objects,
+                    "released_object_bytes": released_object_bytes,
+                    "removed_temp_directories": removed_temp_dirs,
+                    "released_temp_bytes": released_temp_bytes,
+                    "deleted_samples": inventory.sample_count,
+                },
+            )
+            db.commit()
+            return job.result_json or {}
+        except Exception:
+            logger.exception("purge_dataset failed job=%s", job_id)
+            db.rollback()
+            failed_job = db.get(Job, uuid.UUID(job_id))
+            failed_dataset = db.get(Dataset, job.resource_id)
+            if failed_dataset is not None:
+                failed_dataset.status = "purge_failed"
+            if failed_job is not None:
+                transition_job(failed_job, status="failed", stage="failed", error_code="dataset.purge_failed")
+            db.commit()
+            return {"status": "failed", "error_code": "dataset.purge_failed"}
 
 
 @celery_app.task(name="dataset_platform.run_quality_check")

@@ -49,6 +49,31 @@ class DatasetOut(APIModel):
     updated_at: datetime
 
 
+class RemovedDatasetOut(DatasetOut):
+    deleted_at: datetime
+    estimated_bytes: int
+    sample_count: int
+    batch_count: int
+    source_upload_count: int
+
+
+class DatasetPurgePreview(APIModel):
+    dataset_id: uuid.UUID
+    dataset_name: str
+    sample_count: int
+    version_count: int
+    batch_count: int
+    source_upload_count: int
+    object_count: int
+    estimated_bytes: int
+    stale_temp_directory_count: int
+    stale_temp_bytes: int
+
+
+class DatasetPurgeRequest(BaseModel):
+    confirmation_name: str = Field(min_length=1, max_length=200)
+
+
 class Page(BaseModel):
     items: list[Any]
     total: int
@@ -137,11 +162,10 @@ class ExportRequest(BaseModel):
     class_ids: list[int] = Field(default_factory=list, max_length=500)
     include_unannotated: bool = True
 
+
 class ActionJobOut(BaseModel):
     job: JobOut
 
 
 class ErrorResponse(BaseModel):
     error: dict[str, Any]
-
-

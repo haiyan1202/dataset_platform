@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -21,7 +21,7 @@ class Organization(IdTimestampMixin, Base):
     __tablename__ = "organizations"
     name: Mapped[str] = mapped_column(String(160), unique=True)
     status: Mapped[str] = mapped_column(String(32), default="active")
-    storage_quota_bytes: Mapped[int] = mapped_column(default=0)
+    storage_quota_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
 class User(IdTimestampMixin, Base):
@@ -88,7 +88,7 @@ class UploadSession(IdTimestampMixin, Base):
     original_name: Mapped[str] = mapped_column(String(512))
     idempotency_key: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    size_bytes: Mapped[int | None] = mapped_column(nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="created")
     preview_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
@@ -104,7 +104,7 @@ class Asset(IdTimestampMixin, Base):
     relative_path: Mapped[str] = mapped_column(String(1024))
     asset_type: Mapped[str] = mapped_column(String(32))
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    size_bytes: Mapped[int] = mapped_column()
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
     checksum_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
     checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="ready")

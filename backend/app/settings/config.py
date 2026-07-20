@@ -29,7 +29,12 @@ class Settings(BaseSettings):
     worker_concurrency: int = 2
     worker_prefetch_multiplier: int = 1
     worker_max_tasks_per_child: int = 20
+    # Recycle a child after memory-heavy archive extraction/materialization. Celery expects KiB.
+    worker_max_memory_per_child: int = 1_536_000
     worker_temp_reserve_bytes: int = 1 * 1024 * 1024 * 1024
+    import_commit_batch_size: int = 200
+    # Only unmarked/idle temporary directories older than this are eligible for cleanup.
+    worker_temp_stale_seconds: int = 60 * 60
     health_min_free_bytes: int = 1 * 1024 * 1024 * 1024
     bootstrap_email: str = Field(default="admin@example.local", validation_alias=AliasChoices("APP_BOOTSTRAP_EMAIL", "BOOTSTRAP_EMAIL"))
     bootstrap_password: str = Field(default="change-me-before-deploy", validation_alias=AliasChoices("APP_BOOTSTRAP_PASSWORD", "BOOTSTRAP_PASSWORD"))

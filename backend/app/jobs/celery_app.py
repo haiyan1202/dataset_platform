@@ -19,6 +19,7 @@ celery_app.conf.update(
     worker_prefetch_multiplier=settings.worker_prefetch_multiplier,
     worker_concurrency=settings.worker_concurrency,
     worker_max_tasks_per_child=settings.worker_max_tasks_per_child,
+    worker_max_memory_per_child=settings.worker_max_memory_per_child,
     task_soft_time_limit=settings.worker_task_soft_time_limit,
     task_time_limit=settings.worker_task_time_limit,
 )

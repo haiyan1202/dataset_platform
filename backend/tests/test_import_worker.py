@@ -20,6 +20,7 @@ from app.storage.service import ObjectMetadata
 class WorkerStorage:
     def __init__(self, archive: bytes) -> None:
         self.objects: dict[tuple[str, str], bytes] = {("dataset-platform", "uploads/source"): archive}
+        self.uploaded_files = 0
 
     def download_to_file(self, bucket: str, object_key: str, file_path: str) -> None:
         Path(file_path).write_bytes(self.objects[(bucket, object_key)])
@@ -29,6 +30,10 @@ class WorkerStorage:
 
     def put_bytes(self, bucket: str, object_key: str, content: bytes, _content_type: str | None = None) -> None:
         self.objects[(bucket, object_key)] = content
+
+    def upload_file(self, bucket: str, object_key: str, file_path: str, _content_type: str | None = None) -> None:
+        self.uploaded_files += 1
+        self.objects[(bucket, object_key)] = Path(file_path).read_bytes()
 
     def read_bytes(self, bucket: str, object_key: str) -> bytes:
         return self.objects[(bucket, object_key)]
@@ -124,6 +129,8 @@ def test_scan_then_confirm_import_creates_raw_normalized_and_indexed_assets(tmp_
         assert normalized.object_key.endswith("normalized/train/images/cat.jpg.json")
         assert (normalized.bucket, normalized.object_key) in storage.objects
         assert db.get(DatasetVersion, version_id).status == "ready"
+        if original_name.endswith(".7z"):
+            assert storage.uploaded_files >= 2
         quality_job = Job(
             organization_id=organization.id,
             job_type="quality_check",

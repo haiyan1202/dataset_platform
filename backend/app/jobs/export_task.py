@@ -14,6 +14,7 @@ from app.db import SessionLocal
 from app.models import AnnotationIndex, Asset, DatasetVersion, Job, LabelDefinition, Sample, SampleClassIndex
 from app.services import job_is_cancelled, transition_job
 from app.settings import get_settings
+from app.services.purge_service import mark_worker_temp_directory
 from app.storage import get_storage
 from .celery_app import celery_app
 
@@ -316,6 +317,7 @@ def create_export(job_id: str) -> dict:
             if job_is_cancelled(db, job):
                 return {"status": "cancelled"}
             with tempfile.TemporaryDirectory(dir=_work_dir()) as temp_dir:
+                mark_worker_temp_directory(temp_dir, job.id)
                 archive_path = Path(temp_dir) / file_name
                 _write_export_zip(records, labels, requested_format, storage, archive_path)
                 storage.upload_file(bucket, object_key, str(archive_path), "application/zip")

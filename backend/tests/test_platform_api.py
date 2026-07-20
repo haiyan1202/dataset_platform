@@ -14,12 +14,22 @@ from app.auth import hash_password
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
-from app.models import Dataset, DatasetVersion, ImportBatch, LabelDefinition, Membership, Organization, UploadSession, User
+from app.models import (
+    Dataset,
+    DatasetVersion,
+    ImportBatch,
+    LabelDefinition,
+    Membership,
+    Organization,
+    UploadSession,
+    User,
+)
 
 
 class FakeStorage:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
+        self.sizes: dict[tuple[str, str], int] = {}
 
     def ensure_bucket(self, bucket: str) -> None:
         return None
@@ -32,11 +42,18 @@ class FakeStorage:
 
     def stat(self, bucket: str, object_key: str):
         from app.storage.service import ObjectMetadata
-        return ObjectMetadata(bucket, object_key, len(self.objects[(bucket, object_key)]))
+
+        return ObjectMetadata(
+            bucket,
+            object_key,
+            self.sizes.get((bucket, object_key), len(self.objects[(bucket, object_key)])),
+        )
 
 
 @pytest.fixture
-def api_client(tmp_path, monkeypatch) -> Generator[tuple[TestClient, Session, FakeStorage], None, None]:
+def api_client(
+    tmp_path, monkeypatch
+) -> Generator[tuple[TestClient, Session, FakeStorage], None, None]:
     engine = create_engine(f"sqlite:///{tmp_path / 'platform.db'}")
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     Base.metadata.create_all(engine)
@@ -62,6 +79,7 @@ def api_client(tmp_path, monkeypatch) -> Generator[tuple[TestClient, Session, Fa
     monkeypatch.setattr(platform.confirm_import, "delay", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(platform.create_export, "delay", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(platform.run_quality_check, "delay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(platform.purge_dataset, "delay", lambda *_args, **_kwargs: None)
     with TestClient(app) as client:
         yield client, db, storage
     app.dependency_overrides.clear()
@@ -70,7 +88,9 @@ def api_client(tmp_path, monkeypatch) -> Generator[tuple[TestClient, Session, Fa
 
 
 def login(client: TestClient) -> str:
-    response = client.post("/api/auth/login", json={"email": "owner@example.test", "password": "safe-password"})
+    response = client.post(
+        "/api/auth/login", json={"email": "owner@example.test", "password": "safe-password"}
+    )
     assert response.status_code == 200
     return response.json()["access_token"]
 
@@ -80,15 +100,27 @@ def test_dataset_and_direct_upload_session_are_organization_scoped(api_client) -
     token = login(client)
     headers = {"Authorization": f"Bearer {token}"}
     organization = db.query(Organization).one()
-    response = client.post("/api/datasets", headers=headers, json={"organization_id": str(organization.id), "name": "Cars"})
+    response = client.post(
+        "/api/datasets",
+        headers=headers,
+        json={"organization_id": str(organization.id), "name": "Cars"},
+    )
     assert response.status_code == 201
     dataset = response.json()
 
     request_headers = {**headers, "Idempotency-Key": "upload-key-1"}
-    upload = client.post(f"/api/datasets/{dataset['id']}/upload-sessions", headers=request_headers, json={"original_name": "cars.zip", "batch_name": "batch-a"})
+    upload = client.post(
+        f"/api/datasets/{dataset['id']}/upload-sessions",
+        headers=request_headers,
+        json={"original_name": "cars.zip", "batch_name": "batch-a"},
+    )
     assert upload.status_code == 201
     body = upload.json()
-    replay = client.post(f"/api/datasets/{dataset['id']}/upload-sessions", headers=request_headers, json={"original_name": "cars.zip", "batch_name": "batch-a"})
+    replay = client.post(
+        f"/api/datasets/{dataset['id']}/upload-sessions",
+        headers=request_headers,
+        json={"original_name": "cars.zip", "batch_name": "batch-a"},
+    )
     assert replay.status_code == 201
     assert replay.json()["id"] == body["id"]
     assert body["object_key"].startswith(f"org/{organization.id}/datasets/{dataset['id']}/uploads/")
@@ -96,23 +128,157 @@ def test_dataset_and_direct_upload_session_are_organization_scoped(api_client) -
     assert body["upload_url"].startswith("https://storage.invalid/")
 
 
+def test_dataset_delete_hides_the_dataset_from_the_workspace(api_client) -> None:
+    client, db, _storage = api_client
+    token = login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    organization = db.query(Organization).one()
+    created = client.post(
+        "/api/datasets",
+        headers=headers,
+        json={"organization_id": str(organization.id), "name": "Temporary dataset"},
+    )
+    assert created.status_code == 201
+    dataset_id = created.json()["id"]
+
+    deleted = client.delete(
+        f"/api/datasets/{dataset_id}?organization_id={organization.id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204
+
+    visible = client.get(f"/api/datasets?organization_id={organization.id}", headers=headers)
+    assert visible.status_code == 200
+    assert visible.json()["total"] == 0
+    assert db.get(Dataset, uuid.UUID(dataset_id)).deleted_at is not None
+
+    removed = client.get(
+        f"/api/datasets/removed?organization_id={organization.id}", headers=headers
+    )
+    assert removed.status_code == 200
+    assert removed.json()["total"] == 1
+    assert removed.json()["items"][0]["id"] == dataset_id
+    assert removed.json()["items"][0]["estimated_bytes"] == 0
+
+    restored = client.post(
+        f"/api/datasets/{dataset_id}/restore?organization_id={organization.id}",
+        headers=headers,
+    )
+    assert restored.status_code == 200
+    assert restored.json()["id"] == dataset_id
+    assert db.get(Dataset, uuid.UUID(dataset_id)).deleted_at is None
+
+
+def test_complete_upload_accepts_a_multi_gib_archive(api_client) -> None:
+    client, db, storage = api_client
+    token = login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    organization = db.query(Organization).one()
+    dataset = client.post(
+        "/api/datasets",
+        headers=headers,
+        json={"organization_id": str(organization.id), "name": "Large archive"},
+    ).json()
+    created = client.post(
+        f"/api/datasets/{dataset['id']}/upload-sessions",
+        headers=headers,
+        json={"original_name": "large.7z", "batch_name": "large batch"},
+    )
+    assert created.status_code == 201
+    upload = created.json()
+    object_ref = ("dataset-platform", upload["object_key"])
+    storage.objects[object_ref] = b"uploaded"
+    storage.sizes[object_ref] = 9_479_409_751
+
+    completed = client.post(
+        f"/api/upload-sessions/{upload['id']}/complete", headers=headers, json={}
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "queued"
+    assert db.get(UploadSession, uuid.UUID(upload["id"])).size_bytes == 9_479_409_751
+
+
+def test_dataset_purge_preview_requires_the_exact_dataset_name(api_client) -> None:
+    client, db, storage = api_client
+    token = login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    organization = db.query(Organization).one()
+    dataset = client.post(
+        "/api/datasets",
+        headers=headers,
+        json={"organization_id": str(organization.id), "name": "Purge me"},
+    ).json()
+    upload = client.post(
+        f"/api/datasets/{dataset['id']}/upload-sessions",
+        headers=headers,
+        json={"original_name": "purge.zip", "batch_name": "purge batch"},
+    ).json()
+    storage.objects[("dataset-platform", upload["object_key"])] = b"archive"
+    removed = client.delete(
+        f"/api/datasets/{dataset['id']}?organization_id={organization.id}",
+        headers=headers,
+    )
+    assert removed.status_code == 204
+
+    preview = client.get(
+        f"/api/datasets/{dataset['id']}/purge-preview?organization_id={organization.id}",
+        headers=headers,
+    )
+    assert preview.status_code == 200
+    assert preview.json()["object_count"] == 1
+    assert preview.json()["source_upload_count"] == 1
+
+    rejected = client.post(
+        f"/api/datasets/{dataset['id']}/purge?organization_id={organization.id}",
+        headers=headers,
+        json={"confirmation_name": "wrong"},
+    )
+    assert rejected.status_code == 422
+
+    queued = client.post(
+        f"/api/datasets/{dataset['id']}/purge?organization_id={organization.id}",
+        headers=headers,
+        json={"confirmation_name": "Purge me"},
+    )
+    assert queued.status_code == 202
+    assert queued.json()["job"]["job_type"] == "purge_dataset"
+    assert db.get(Dataset, uuid.UUID(dataset["id"])).status == "purging"
+
+
 def test_export_request_validates_supported_format_and_can_be_cancelled(api_client) -> None:
     client, db, _storage = api_client
     token = login(client)
     headers = {"Authorization": f"Bearer {token}"}
     organization = db.query(Organization).one()
-    dataset = client.post("/api/datasets", headers=headers, json={"organization_id": str(organization.id), "name": "Road"}).json()
-    invalid = client.post(f"/api/datasets/{dataset['id']}/exports?organization_id={organization.id}", headers=headers, json={"format": "invalid"})
+    dataset = client.post(
+        "/api/datasets",
+        headers=headers,
+        json={"organization_id": str(organization.id), "name": "Road"},
+    ).json()
+    invalid = client.post(
+        f"/api/datasets/{dataset['id']}/exports?organization_id={organization.id}",
+        headers=headers,
+        json={"format": "invalid"},
+    )
     assert invalid.status_code == 422
-    valid = client.post(f"/api/datasets/{dataset['id']}/exports?organization_id={organization.id}", headers=headers, json={"format": "coco"})
+    valid = client.post(
+        f"/api/datasets/{dataset['id']}/exports?organization_id={organization.id}",
+        headers=headers,
+        json={"format": "coco"},
+    )
     assert valid.status_code == 202
     job = valid.json()["job"]
     assert job["result_json"]["requested_format"] == "coco"
-    cancelled = client.post(f"/api/jobs/{job['id']}/cancel?organization_id={organization.id}", headers=headers, json={})
+    cancelled = client.post(
+        f"/api/jobs/{job['id']}/cancel?organization_id={organization.id}", headers=headers, json={}
+    )
     assert cancelled.status_code == 202
     assert cancelled.json()["status"] == "cancelled"
-    second_cancel = client.post(f"/api/jobs/{job['id']}/cancel?organization_id={organization.id}", headers=headers, json={})
+    second_cancel = client.post(
+        f"/api/jobs/{job['id']}/cancel?organization_id={organization.id}", headers=headers, json={}
+    )
     assert second_cancel.status_code == 409
+
 
 def test_upload_session_accepts_common_archives_and_rejects_unsupported_ones(api_client) -> None:
     client, db, _storage = api_client
@@ -124,7 +290,12 @@ def test_upload_session_accepts_common_archives_and_rejects_unsupported_ones(api
         headers=headers,
         json={"organization_id": str(organization.id), "name": "Archive formats"},
     ).json()
-    for name, suffix in (("images.7z", ".7z"), ("images.tar", ".tar"), ("images.tar.gz", ".tar.gz"), ("images.tgz", ".tgz")):
+    for name, suffix in (
+        ("images.7z", ".7z"),
+        ("images.tar", ".tar"),
+        ("images.tar.gz", ".tar.gz"),
+        ("images.tgz", ".tgz"),
+    ):
         response = client.post(
             f"/api/datasets/{dataset['id']}/upload-sessions",
             headers=headers,
@@ -140,6 +311,7 @@ def test_upload_session_accepts_common_archives_and_rejects_unsupported_ones(api
     assert invalid.status_code == 422
     assert invalid.json()["detail"] == "upload.archive_required"
 
+
 def test_part_metadata_soft_delete_and_label_management(api_client) -> None:
     client, db, storage = api_client
     token = login(client)
@@ -154,10 +326,17 @@ def test_part_metadata_soft_delete_and_label_management(api_client) -> None:
     dataset_id = dataset_response.json()["id"]
     dataset = db.get(Dataset, uuid.UUID(dataset_id))
     assert dataset is not None
-    version = DatasetVersion(dataset_id=dataset.id, version_number=1, created_by=db.query(User).one().id, status="ready")
+    version = DatasetVersion(
+        dataset_id=dataset.id, version_number=1, created_by=db.query(User).one().id, status="ready"
+    )
     db.add(version)
     db.flush()
-    batch = ImportBatch(dataset_version_id=version.id, batch_number=1, batch_name="Original part", created_by=version.created_by)
+    batch = ImportBatch(
+        dataset_version_id=version.id,
+        batch_number=1,
+        batch_name="Original part",
+        created_by=version.created_by,
+    )
     label = LabelDefinition(dataset_version_id=version.id, class_id=0, class_name="old name")
     db.add_all([batch, label])
     db.commit()
@@ -186,7 +365,10 @@ def test_part_metadata_soft_delete_and_label_management(api_client) -> None:
     assert keypoints.status_code == 200
     assert keypoints.json()["names"] == ["nose", "tail"]
 
-    batches = client.get(f"/api/datasets/{dataset_id}/import-batches?organization_id={organization.id}", headers=headers)
+    batches = client.get(
+        f"/api/datasets/{dataset_id}/import-batches?organization_id={organization.id}",
+        headers=headers,
+    )
     assert batches.status_code == 200
     assert batches.json()["items"][0]["note"] == "field capture"
     storage.objects[("dataset-platform", "uploads/rescan.zip")] = b"archive"
@@ -223,11 +405,20 @@ def test_part_metadata_soft_delete_and_label_management(api_client) -> None:
     assert history.status_code == 200
     latest = history.json()["items"][0]
     assert latest["action"] == "import_batch.delete"
-    undone = client.post(f"/api/operation-history/{latest['id']}/undo?organization_id={organization.id}", headers=headers)
+    undone = client.post(
+        f"/api/operation-history/{latest['id']}/undo?organization_id={organization.id}",
+        headers=headers,
+    )
     assert undone.status_code == 200
     assert undone.json()["status"] == "undone"
-    restored = client.get(f"/api/datasets/{dataset_id}/import-batches?organization_id={organization.id}", headers=headers)
+    restored = client.get(
+        f"/api/datasets/{dataset_id}/import-batches?organization_id={organization.id}",
+        headers=headers,
+    )
     assert restored.json()["total"] == 1
-    redone = client.post(f"/api/operation-history/{latest['id']}/redo?organization_id={organization.id}", headers=headers)
+    redone = client.post(
+        f"/api/operation-history/{latest['id']}/redo?organization_id={organization.id}",
+        headers=headers,
+    )
     assert redone.status_code == 200
     assert redone.json()["status"] == "applied"
