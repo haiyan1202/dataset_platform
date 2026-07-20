@@ -17,7 +17,8 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_secure: bool = False
     minio_bucket: str = "dataset-platform"
-    minio_public_endpoint: str = "http://127.0.0.1:9000"
+    # Use Nginx as a same-origin streaming proxy so browser uploads work from both Windows and WSL.
+    minio_public_endpoint: str = "/storage"
     token_secret: str = Field(min_length=32, default="replace-this-development-secret-before-deploy")
     token_ttl_seconds: int = 3600 * 8
     max_upload_bytes: int = 10 * 1024 * 1024 * 1024

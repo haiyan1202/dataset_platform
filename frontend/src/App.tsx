@@ -52,6 +52,7 @@ export default function App() {
   const [filters, setFilters] = useState({ name: "", subset: "", format: "", classId: "", annotation: "" });
   const [newName, setNewName] = useState(""), [file, setFile] = useState<File | null>(null), [batchName, setBatchName] = useState(""), [uploadProgress, setUploadProgress] = useState<number | null>(null), [exportFormat, setExportFormat] = useState("coco"), [exportSubsets, setExportSubsets] = useState<string[]>([]), [includeUnannotated, setIncludeUnannotated] = useState(true), [editableLabels, setEditableLabels] = useState<Label[]>([]), [editableBatch, setEditableBatch] = useState<Batch | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const pollingRef = useRef(false);
   const notify = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(current => current === message ? "" : current), 4500); };
   const fail = (error: unknown) => notify(error instanceof Error ? error.message : "操作未完成，请稍后重试。");
   const selectedBatch = batches.find(item => item.id === batchId);
@@ -63,11 +64,49 @@ export default function App() {
   useEffect(() => { void reloadShell().catch(fail); }, [token]);
   useEffect(() => { setOffset(0); setSelectedIds([]); setPreview(null); setNormalized(null); }, [dataset?.id, batchId, filters.name, filters.subset, filters.format, filters.classId, filters.annotation]);
   useEffect(() => { void reloadWorkspace().catch(fail); }, [token, org?.id, dataset?.id, offset, batchId, filters.name, filters.subset, filters.format, filters.classId, filters.annotation]);
-  useEffect(() => { if (!token) return; const timer = window.setInterval(() => void Promise.all([reloadShell(), reloadWorkspace()]), 5000); return () => window.clearInterval(timer); }, [token, org?.id, dataset?.id, offset, batchId, filters]);
+  useEffect(() => {
+    if (!token) return;
+    let disposed = false;
+    const poll = async () => {
+      // Statistics/history queries are intentionally skipped during a direct upload.
+      // They otherwise contend with the browser's large request and can pile up when
+      // a slow WSL service takes longer than the old five-second interval.
+      if (disposed || pollingRef.current || uploadProgress !== null) return;
+      pollingRef.current = true;
+      try {
+        await Promise.all([reloadShell(), reloadWorkspace()]);
+      } catch (error) {
+        if (!disposed) fail(error);
+      } finally {
+        pollingRef.current = false;
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 15000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [token, org?.id, dataset?.id, offset, batchId, filters.name, filters.subset, filters.format, filters.classId, filters.annotation, uploadProgress]);
 
   const signIn = async (event: FormEvent) => { event.preventDefault(); try { const auth = await api<{ access_token: string }>("/auth/login", undefined, { method: "POST", body: JSON.stringify({ email, password }) }); localStorage.setItem("dataset-platform-token", auth.access_token); setToken(auth.access_token); notify("已登录到数据集工作台。"); } catch (error) { fail(error); } };
   const createDataset = async (event: FormEvent) => { event.preventDefault(); if (!org || !newName.trim()) return; try { await api("/datasets", token, { method: "POST", body: JSON.stringify({ organization_id: org.id, name: newName.trim() }) }); setNewName(""); setModal(null); await reloadShell(); notify("数据集已创建。"); } catch (error) { fail(error); } };
-  const directUpload = (url: string, source: File) => new Promise<void>((resolve, reject) => { const request = new XMLHttpRequest(); request.open("PUT", url); request.upload.onprogress = event => { if (event.lengthComputable) setUploadProgress(Math.round(event.loaded / event.total * 100)); }; request.onerror = () => reject(new Error("upload.direct_put_failed")); request.onload = () => request.status >= 200 && request.status < 300 ? resolve() : reject(new Error("upload.direct_put_failed")); request.send(source); });
+  const directUpload = (url: string, source: File) => new Promise<void>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    let reportedProgress = -1;
+    request.open("PUT", url);
+    request.upload.onprogress = event => {
+      if (!event.lengthComputable) return;
+      const nextProgress = Math.min(100, Math.floor(event.loaded / event.total * 100));
+      // Progress events can arrive dozens of times per second for large files.
+      // Only rerender when the displayed percentage actually changes.
+      if (nextProgress !== reportedProgress) {
+        reportedProgress = nextProgress;
+        setUploadProgress(nextProgress);
+      }
+    };
+    request.onerror = () => reject(new Error("upload.direct_put_failed"));
+    request.onabort = () => reject(new Error("upload.cancelled"));
+    request.ontimeout = () => reject(new Error("upload.timed_out"));
+    request.onload = () => request.status >= 200 && request.status < 300 ? resolve() : reject(new Error("upload.direct_put_failed"));
+    request.send(source);
+  });
   const upload = async (event: FormEvent) => { event.preventDefault(); if (!dataset || !file) return; try { setUploadProgress(0); const session = await api<Upload>(`/datasets/${dataset.id}/upload-sessions`, token, { method: "POST", body: JSON.stringify({ original_name: file.name, batch_name: batchName.trim() || "Upload batch" }) }); if (!session.upload_url) throw new Error("upload.url_missing"); await directUpload(session.upload_url, file); await api(`/upload-sessions/${session.id}/complete`, token, { method: "POST", body: "{}" }); setModal(null); setFile(null); notify("归档已上传，正在安全扫描。扫描完成后请确认导入。"); await reloadShell(); await reloadWorkspace(); } catch (error) { fail(error); } finally { setUploadProgress(null); } };
   const confirmUpload = async (item: Upload) => { try { await api(`/upload-sessions/${item.id}/confirm`, token, { method: "POST", body: "{}" }); notify("已确认导入，正在创建样本索引。"); await reloadShell(); await reloadWorkspace(); } catch (error) { fail(error); } };
   const openPreview = async (sample: Sample) => { if (!org) return; try { const next = await api<Preview>(`/samples/${sample.id}?organization_id=${org.id}`, token); setPreview(next); setNormalized(next.normalized_annotation_url ? await fetch(next.normalized_annotation_url).then(response => response.ok ? response.json() : null) : null); } catch (error) { fail(error); } };
