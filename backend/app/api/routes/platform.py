@@ -548,7 +548,11 @@ def list_samples(
     elif has_annotation is False:
         query = query.where(Sample.annotation_asset_id.is_(None))
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
-    samples = list(db.scalars(query.order_by(Sample.created_at.desc()).offset(offset).limit(limit)))
+    samples = list(
+        db.scalars(
+            query.order_by(Sample.created_at.desc(), Sample.id.desc()).offset(offset).limit(limit)
+        )
+    )
     return Page(
         items=[SampleOut.model_validate(item).model_dump() for item in samples],
         total=total,
@@ -788,32 +792,55 @@ def queue_quality_check(
 
 @router.get("/datasets/{dataset_id}/statistics")
 def dataset_statistics(
-    dataset_id: uuid.UUID, organization_id: uuid.UUID, user: CurrentUser, db: DB
+    dataset_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    user: CurrentUser,
+    db: DB,
+    subset: str | None = None,
+    annotation_type: str | None = None,
+    class_id: int | None = None,
+    file_name: str | None = None,
+    import_batch_id: uuid.UUID | None = None,
+    has_annotation: bool | None = None,
 ) -> dict:
     require_membership(db, organization_id, user.id)
     dataset = get_dataset_for_org(db, dataset_id, organization_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="dataset.not_found")
     versions = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset.id)
-    total = (
-        db.scalar(
-            select(func.count())
-            .select_from(Sample)
-            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
-        )
-        or 0
+    matching_ids = select(Sample.id).where(
+        Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None)
     )
+    if subset:
+        matching_ids = matching_ids.where(Sample.subset == subset)
+    if annotation_type:
+        matching_ids = matching_ids.where(Sample.annotation_type == annotation_type)
+    if class_id is not None:
+        matching_ids = matching_ids.join(
+            SampleClassIndex, SampleClassIndex.sample_id == Sample.id
+        ).where(SampleClassIndex.class_id == class_id)
+    if file_name:
+        matching_ids = matching_ids.where(Sample.file_name.ilike(f"%{file_name[:160]}%"))
+    if import_batch_id:
+        matching_ids = matching_ids.where(Sample.import_batch_id == import_batch_id)
+    if has_annotation is True:
+        matching_ids = matching_ids.where(Sample.annotation_asset_id.is_not(None))
+    elif has_annotation is False:
+        matching_ids = matching_ids.where(Sample.annotation_asset_id.is_(None))
+    sample_ids = matching_ids.distinct().subquery()
+    sample_id_select = select(sample_ids.c.id)
+    total = db.scalar(select(func.count()).select_from(sample_ids)) or 0
     by_subset = dict(
         db.execute(
             select(Sample.subset, func.count())
-            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+            .where(Sample.id.in_(sample_id_select))
             .group_by(Sample.subset)
         ).all()
     )
     by_annotation = dict(
         db.execute(
             select(Sample.annotation_type, func.count())
-            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+            .where(Sample.id.in_(sample_id_select))
             .group_by(Sample.annotation_type)
         ).all()
     )
@@ -821,7 +848,7 @@ def dataset_statistics(
         db.execute(
             select(SampleClassIndex.class_id, func.count())
             .join(Sample, Sample.id == SampleClassIndex.sample_id)
-            .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+            .where(Sample.id.in_(sample_id_select))
             .group_by(SampleClassIndex.class_id)
         ).all()
     )
@@ -833,17 +860,13 @@ def dataset_statistics(
             func.coalesce(func.sum(AnnotationIndex.keypoint_count), 0),
         )
         .join(Sample, Sample.id == AnnotationIndex.sample_id)
-        .where(Sample.dataset_version_id.in_(versions), Sample.deleted_at.is_(None))
+        .where(Sample.id.in_(sample_id_select))
     ).one()
     missing_annotation_count = (
         db.scalar(
             select(func.count())
             .select_from(Sample)
-            .where(
-                Sample.dataset_version_id.in_(versions),
-                Sample.deleted_at.is_(None),
-                Sample.annotation_asset_id.is_(None),
-            )
+            .where(Sample.id.in_(sample_id_select), Sample.annotation_asset_id.is_(None))
         )
         or 0
     )
@@ -852,11 +875,7 @@ def dataset_statistics(
         for batch_id, batch_name, count in db.execute(
             select(ImportBatch.id, ImportBatch.batch_name, func.count(Sample.id))
             .join(Sample, Sample.import_batch_id == ImportBatch.id)
-            .where(
-                Sample.dataset_version_id.in_(versions),
-                Sample.deleted_at.is_(None),
-                ImportBatch.deleted_at.is_(None),
-            )
+            .where(Sample.id.in_(sample_id_select), ImportBatch.deleted_at.is_(None))
             .group_by(ImportBatch.id, ImportBatch.batch_name)
             .order_by(ImportBatch.created_at.desc())
         ).all()

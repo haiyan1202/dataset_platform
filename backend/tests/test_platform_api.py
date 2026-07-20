@@ -15,12 +15,14 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
 from app.models import (
+    Asset,
     Dataset,
     DatasetVersion,
     ImportBatch,
     LabelDefinition,
     Membership,
     Organization,
+    Sample,
     UploadSession,
     User,
 )
@@ -167,6 +169,126 @@ def test_dataset_delete_hides_the_dataset_from_the_workspace(api_client) -> None
     assert restored.status_code == 200
     assert restored.json()["id"] == dataset_id
     assert db.get(Dataset, uuid.UUID(dataset_id)).deleted_at is None
+
+
+def test_statistics_match_the_same_filtered_samples_as_the_browser(api_client) -> None:
+    client, db, _storage = api_client
+    token = login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    organization = db.query(Organization).one()
+    user = db.query(User).one()
+    dataset = client.post(
+        "/api/datasets",
+        headers=headers,
+        json={"organization_id": str(organization.id), "name": "Statistics filters"},
+    ).json()
+    version = DatasetVersion(
+        dataset_id=uuid.UUID(dataset["id"]), version_number=1, created_by=user.id
+    )
+    db.add(version)
+    db.flush()
+    first_batch = ImportBatch(
+        dataset_version_id=version.id,
+        batch_number=1,
+        batch_name="first",
+        created_by=user.id,
+    )
+    second_batch = ImportBatch(
+        dataset_version_id=version.id,
+        batch_number=2,
+        batch_name="second",
+        created_by=user.id,
+    )
+    db.add_all([first_batch, second_batch])
+    db.flush()
+
+    image_assets = [
+        Asset(
+            organization_id=organization.id,
+            bucket="dataset-platform",
+            object_key=f"stats/image-{index}.jpg",
+            original_name=f"image-{index}.jpg",
+            relative_path=f"image-{index}.jpg",
+            asset_type="image",
+            size_bytes=1,
+        )
+        for index in range(3)
+    ]
+    annotation_assets = [
+        Asset(
+            organization_id=organization.id,
+            bucket="dataset-platform",
+            object_key=f"stats/annotation-{index}.txt",
+            original_name=f"annotation-{index}.txt",
+            relative_path=f"annotation-{index}.txt",
+            asset_type="annotation",
+            size_bytes=1,
+        )
+        for index in range(2)
+    ]
+    db.add_all([*image_assets, *annotation_assets])
+    db.flush()
+    db.add_all(
+        [
+            Sample(
+                dataset_version_id=version.id,
+                import_batch_id=first_batch.id,
+                image_asset_id=image_assets[0].id,
+                annotation_asset_id=annotation_assets[0].id,
+                file_name="first-annotated.jpg",
+                file_stem="first-annotated",
+                relative_path="first-annotated.jpg",
+                subset="train",
+                annotation_type="yolo",
+            ),
+            Sample(
+                dataset_version_id=version.id,
+                import_batch_id=first_batch.id,
+                image_asset_id=image_assets[1].id,
+                file_name="first-missing.jpg",
+                file_stem="first-missing",
+                relative_path="first-missing.jpg",
+                subset="val",
+                annotation_type="yolo",
+            ),
+            Sample(
+                dataset_version_id=version.id,
+                import_batch_id=second_batch.id,
+                image_asset_id=image_assets[2].id,
+                annotation_asset_id=annotation_assets[1].id,
+                file_name="second-annotated.jpg",
+                file_stem="second-annotated",
+                relative_path="second-annotated.jpg",
+                subset="train",
+                annotation_type="coco",
+            ),
+        ]
+    )
+    db.commit()
+
+    query = f"organization_id={organization.id}&import_batch_id={first_batch.id}"
+    samples = client.get(f"/api/datasets/{dataset['id']}/samples?{query}", headers=headers)
+    statistics = client.get(f"/api/datasets/{dataset['id']}/statistics?{query}", headers=headers)
+    assert samples.status_code == 200
+    assert statistics.status_code == 200
+    assert samples.json()["total"] == 2
+    assert statistics.json()["sample_count"] == 2
+    assert statistics.json()["annotated_sample_count"] == 1
+    assert statistics.json()["missing_annotation_count"] == 1
+    assert statistics.json()["by_subset"] == {"train": 1, "val": 1}
+    assert statistics.json()["by_annotation_type"] == {"yolo": 2}
+
+    annotated_query = f"{query}&has_annotation=true"
+    annotated_samples = client.get(
+        f"/api/datasets/{dataset['id']}/samples?{annotated_query}", headers=headers
+    )
+    annotated_statistics = client.get(
+        f"/api/datasets/{dataset['id']}/statistics?{annotated_query}", headers=headers
+    )
+    assert annotated_samples.json()["total"] == 1
+    assert annotated_statistics.json()["sample_count"] == 1
+    assert annotated_statistics.json()["annotated_sample_count"] == 1
+    assert annotated_statistics.json()["missing_annotation_count"] == 0
 
 
 def test_complete_upload_accepts_a_multi_gib_archive(api_client) -> None:

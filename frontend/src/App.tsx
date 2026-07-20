@@ -314,6 +314,7 @@ export default function App() {
     [purgeConfirmation, setPurgeConfirmation] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const samplesScrollRef = useRef<HTMLDivElement>(null);
+  const selectAllCheckboxRef = useRef<HTMLInputElement>(null);
   const pollingRef = useRef(false);
   const samplesLoadingRef = useRef(false);
   const sampleRequestRef = useRef(0);
@@ -328,6 +329,9 @@ export default function App() {
   const fail = (error: unknown) =>
     notify(error instanceof Error ? error.message : "操作未完成，请稍后重试。");
   const selectedBatch = batches.find((item) => item.id === batchId);
+  const hasSelectedSamples = selectedIds.length > 0;
+  const allMatchingSamplesSelected =
+    sampleTotal > 0 && selectedIds.length >= sampleTotal;
 
   const reloadShell = async () => {
     if (!token) return;
@@ -371,10 +375,7 @@ export default function App() {
         `/datasets/${dataset.id}/upload-sessions?organization_id=${org.id}`,
         token,
       ),
-      api<Stats>(
-        `/datasets/${dataset.id}/statistics?organization_id=${org.id}`,
-        token,
-      ),
+      api<Stats>(`/datasets/${dataset.id}/statistics?${sampleQuery(0)}`, token),
       api<Label[]>(
         `/datasets/${dataset.id}/labels?organization_id=${org.id}`,
         token,
@@ -471,6 +472,12 @@ export default function App() {
       if (requestId === selectionRequestRef.current) setSelectingAll(false);
     }
   };
+  useEffect(() => {
+    if (selectAllCheckboxRef.current) {
+      selectAllCheckboxRef.current.indeterminate =
+        hasSelectedSamples && !allMatchingSamplesSelected;
+    }
+  }, [hasSelectedSamples, allMatchingSamplesSelected]);
   useEffect(() => {
     authExpiredHandler = () => setToken("");
     return () => {
@@ -1505,12 +1512,11 @@ export default function App() {
                     <label>
                       <input
                         type="checkbox"
-                        checked={
-                          sampleTotal > 0 && selectedIds.length === sampleTotal
-                        }
+                        ref={selectAllCheckboxRef}
+                        checked={allMatchingSamplesSelected}
                         disabled={selectingAll || sampleTotal === 0}
-                        onChange={(event) =>
-                          void selectAllMatchingSamples(event.target.checked)
+                        onChange={() =>
+                          void selectAllMatchingSamples(!hasSelectedSamples)
                         }
                       />
                     </label>
