@@ -1,0 +1,21 @@
+[Unit]
+Description=Dataset Platform MinIO object storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dataset-platform
+Group=dataset-platform
+EnvironmentFile=/etc/dataset-platform/dataset-platform.env
+WorkingDirectory=/opt/dataset-platform
+ExecStart=/usr/local/bin/minio server ${MINIO_DATA_DIR} --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

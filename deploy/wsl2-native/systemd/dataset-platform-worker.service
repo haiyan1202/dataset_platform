@@ -1,0 +1,26 @@
+[Unit]
+Description=Dataset Platform Celery Worker
+After=network-online.target postgresql.service redis-server.service dataset-platform-minio.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service dataset-platform-minio.service
+
+[Service]
+Type=simple
+User=dataset-platform
+Group=dataset-platform
+EnvironmentFile=/etc/dataset-platform/dataset-platform.env
+WorkingDirectory=@APP_ROOT@
+Environment=PYTHONPATH=@APP_ROOT@/src:@APP_ROOT@/backend
+ExecStart=@APP_ROOT@/.venv/bin/celery -A app.jobs.celery_app.celery_app worker --loglevel=INFO --hostname=dataset-worker@%%h
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/var/lib/dataset-platform
+MemoryMax=4G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target
+

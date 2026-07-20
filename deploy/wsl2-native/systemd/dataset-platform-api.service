@@ -1,0 +1,23 @@
+[Unit]
+Description=Dataset Platform FastAPI API
+After=network-online.target postgresql.service redis-server.service dataset-platform-minio.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service dataset-platform-minio.service
+
+[Service]
+Type=simple
+User=dataset-platform
+Group=dataset-platform
+EnvironmentFile=/etc/dataset-platform/dataset-platform.env
+WorkingDirectory=@APP_ROOT@
+Environment=PYTHONPATH=@APP_ROOT@/src:@APP_ROOT@/backend
+ExecStart=@APP_ROOT@/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/var/lib/dataset-platform
+
+[Install]
+WantedBy=multi-user.target
