@@ -290,6 +290,7 @@ export default function App() {
   const [batchId, setBatchId] = useState(""),
     [selectedIds, setSelectedIds] = useState<string[]>([]),
     [modal, setModal] = useState<ModalName>(null),
+    [selectingAll, setSelectingAll] = useState(false),
     [notice, setNotice] = useState(""),
     [showStats, setShowStats] = useState(false);
   const [filters, setFilters] = useState({
@@ -316,6 +317,7 @@ export default function App() {
   const pollingRef = useRef(false);
   const samplesLoadingRef = useRef(false);
   const sampleRequestRef = useRef(0);
+  const selectionRequestRef = useRef(0);
   const notify = (message: string) => {
     setNotice(message);
     window.setTimeout(
@@ -393,11 +395,9 @@ export default function App() {
     setIssues(issueData.items);
     setHistory(historyData.items);
   };
-  const loadSamplePage = async (nextOffset: number, append: boolean) => {
-    if (!token || !org || !dataset || view !== "workspace") return;
-    const requestId = ++sampleRequestRef.current;
+  const sampleQuery = (nextOffset: number) => {
     const q = new URLSearchParams({
-      organization_id: org.id,
+      organization_id: org?.id ?? "",
       limit: "100",
       offset: String(nextOffset),
     });
@@ -407,8 +407,13 @@ export default function App() {
     if (filters.classId) q.set("class_id", filters.classId);
     if (batchId) q.set("import_batch_id", batchId);
     if (filters.annotation) q.set("has_annotation", filters.annotation);
+    return q;
+  };
+  const loadSamplePage = async (nextOffset: number, append: boolean) => {
+    if (!token || !org || !dataset || view !== "workspace") return;
+    const requestId = ++sampleRequestRef.current;
     const sampleData = await api<Page<Sample>>(
-      `/datasets/${dataset.id}/samples?${q}`,
+      `/datasets/${dataset.id}/samples?${sampleQuery(nextOffset)}`,
       token,
     );
     if (requestId !== sampleRequestRef.current) return;
@@ -433,6 +438,39 @@ export default function App() {
       samplesLoadingRef.current = false;
     }
   };
+  const selectAllMatchingSamples = async (checked: boolean) => {
+    if (!checked) {
+      selectionRequestRef.current += 1;
+      setSelectedIds([]);
+      return;
+    }
+    if (!token || !org || !dataset || sampleTotal === 0) return;
+    const requestId = ++selectionRequestRef.current;
+    setSelectingAll(true);
+    try {
+      const ids: string[] = [];
+      let nextOffset = 0;
+      let total = Number.POSITIVE_INFINITY;
+      while (nextOffset < total) {
+        const page = await api<Page<Sample>>(
+          `/datasets/${dataset.id}/samples?${sampleQuery(nextOffset)}`,
+          token,
+        );
+        if (requestId !== selectionRequestRef.current) return;
+        ids.push(...page.items.map((item) => item.id));
+        total = page.total;
+        nextOffset += page.items.length;
+        if (page.items.length === 0) break;
+      }
+      if (requestId === selectionRequestRef.current) {
+        setSelectedIds([...new Set(ids)]);
+      }
+    } catch (error) {
+      if (requestId === selectionRequestRef.current) fail(error);
+    } finally {
+      if (requestId === selectionRequestRef.current) setSelectingAll(false);
+    }
+  };
   useEffect(() => {
     authExpiredHandler = () => setToken("");
     return () => {
@@ -443,6 +481,8 @@ export default function App() {
     void reloadShell().catch(fail);
   }, [token]);
   useEffect(() => {
+    selectionRequestRef.current += 1;
+    setSelectingAll(false);
     setSamples([]);
     setSampleTotal(0);
     setSelectedIds([]);
@@ -713,19 +753,25 @@ export default function App() {
       fail(error);
     }
   };
+  const sampleChunks = (ids: string[]) =>
+    Array.from({ length: Math.ceil(ids.length / 500) }, (_, index) =>
+      ids.slice(index * 500, (index + 1) * 500),
+    );
   const subset = async (ids: string[], value: string | null) => {
     if (!dataset || !org || !ids.length) return;
     try {
-      await api(
-        `/datasets/${dataset.id}/samples/subset?organization_id=${org.id}`,
-        token,
-        {
-          method: "POST",
-          body: JSON.stringify({ sample_ids: ids, subset: value }),
-        },
-      );
+      for (const chunk of sampleChunks(ids)) {
+        await api(
+          `/datasets/${dataset.id}/samples/subset?organization_id=${org.id}`,
+          token,
+          {
+            method: "POST",
+            body: JSON.stringify({ sample_ids: chunk, subset: value }),
+          },
+        );
+      }
       setSelectedIds([]);
-      notify(`已更新 ${ids.length} 个样本的子集。`);
+      notify(`??? ${ids.length} ???????`);
       await reloadWorkspace();
     } catch (error) {
       fail(error);
@@ -736,21 +782,21 @@ export default function App() {
       !dataset ||
       !org ||
       !ids.length ||
-      !window.confirm(
-        `确定删除 ${ids.length} 个样本吗？该操作可在历史记录中撤销。`,
-      )
+      !window.confirm(`???? ${ids.length} ??????????????????`)
     )
       return;
     try {
-      await api(
-        `/datasets/${dataset.id}/samples/delete?organization_id=${org.id}`,
-        token,
-        { method: "POST", body: JSON.stringify({ sample_ids: ids }) },
-      );
+      for (const chunk of sampleChunks(ids)) {
+        await api(
+          `/datasets/${dataset.id}/samples/delete?organization_id=${org.id}`,
+          token,
+          { method: "POST", body: JSON.stringify({ sample_ids: chunk }) },
+        );
+      }
       setSelectedIds([]);
       setPreview(null);
       setNormalized(null);
-      notify("样本已删除，可在操作历史中撤销。");
+      notify("????????????????");
       await reloadWorkspace();
     } catch (error) {
       fail(error);
@@ -1306,36 +1352,38 @@ export default function App() {
                               {new Date(item.created_at).toLocaleDateString()}
                             </small>
                           </span>
+                        </button>
+                        <div className="part-card-footer">
                           <span className={`batch-status ${item.status}`}>
                             {batchStatusLabel(item.status)}
                           </span>
-                        </button>
-                        <div className="part-card-actions">
-                          {pendingUpload && (
+                          <div className="part-card-actions">
+                            {pendingUpload && (
+                              <button
+                                className="confirm-batch"
+                                onClick={() => confirmUpload(pendingUpload)}
+                              >
+                                {"\u786e\u8ba4\u5bfc\u5165"}
+                              </button>
+                            )}
                             <button
-                              className="confirm-batch"
-                              onClick={() => confirmUpload(pendingUpload)}
+                              onClick={() => {
+                                setEditableBatch({ ...item });
+                                setModal("batch");
+                              }}
                             >
-                              {"\u786e\u8ba4\u5bfc\u5165"}
+                              {"\u7f16\u8f91"}
                             </button>
-                          )}
-                          <button
-                            onClick={() => {
-                              setEditableBatch({ ...item });
-                              setModal("batch");
-                            }}
-                          >
-                            {"\u7f16\u8f91"}
-                          </button>
-                          <button onClick={() => rescan(item)}>
-                            {"\u91cd\u626b"}
-                          </button>
-                          <button
-                            className="danger-text"
-                            onClick={() => deleteBatch(item)}
-                          >
-                            {"\u5220\u9664"}
-                          </button>
+                            <button onClick={() => rescan(item)}>
+                              {"\u91cd\u626b"}
+                            </button>
+                            <button
+                              className="danger-text"
+                              onClick={() => deleteBatch(item)}
+                            >
+                              {"\u5220\u9664"}
+                            </button>
+                          </div>
                         </div>
                       </article>
                     );
@@ -1458,15 +1506,11 @@ export default function App() {
                       <input
                         type="checkbox"
                         checked={
-                          samples.length > 0 &&
-                          samples.every((item) => selectedIds.includes(item.id))
+                          sampleTotal > 0 && selectedIds.length === sampleTotal
                         }
+                        disabled={selectingAll || sampleTotal === 0}
                         onChange={(event) =>
-                          setSelectedIds(
-                            event.target.checked
-                              ? samples.map((item) => item.id)
-                              : [],
-                          )
+                          void selectAllMatchingSamples(event.target.checked)
                         }
                       />
                     </label>
@@ -1489,6 +1533,7 @@ export default function App() {
                           <input
                             type="checkbox"
                             checked={selectedIds.includes(item.id)}
+                            disabled={selectingAll}
                             onChange={(event) =>
                               setSelectedIds((current) =>
                                 event.target.checked

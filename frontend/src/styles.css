@@ -69,3 +69,25 @@
   .trash-page { padding: 34px 25px; }
   .sample-table { max-height: 520px; }
 }
+
+/* Keep the complete batch state in the lower-left card footer. */
+.part-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 8px 8px;
+}
+.part-card-footer .batch-status {
+  flex: 0 1 auto;
+  max-width: calc(100% - 92px);
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  line-height: 1.25;
+}
+.part-card-footer .part-card-actions {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+}
